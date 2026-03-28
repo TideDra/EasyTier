@@ -506,6 +506,13 @@ fn get_system_config(
         return Ok(Some(Box::new(DarwinConfigurator::new())));
     }
 
+    #[cfg(target_os = "linux")]
+    {
+        use super::system_config::linux;
+        let tun_name = _tun_name.ok_or_else(|| anyhow::anyhow!("No tun name"))?;
+        return Ok(Some(linux::new_os_configurator(tun_name)?));
+    }
+
     #[allow(unreachable_code)]
     Ok(None)
 }
