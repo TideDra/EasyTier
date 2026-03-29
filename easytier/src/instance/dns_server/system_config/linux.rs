@@ -51,12 +51,19 @@ impl SystemConfig for ResolvedManager {
             )));
         }
 
-        // resolvectl domain <iface> ~<domain1> ~<domain2> ...
-        // The ~ prefix marks routing-only domains.
+        // resolvectl domain <iface> ~<domain1> <domain1> ...
+        // ~ prefix = routing domain (queries matching go to this DNS server)
+        // Without ~ = search domain (short names get this suffix appended)
         let mut args = vec!["domain".to_string(), self.tun_name.clone()];
         for domain in &cfg.match_domains {
             let d = domain.trim_end_matches('.');
             args.push(format!("~{}", d));
+        }
+        for domain in &cfg.search_domains {
+            let d = domain.trim_end_matches('.');
+            if !args.contains(&d.to_string()) {
+                args.push(d.to_string());
+            }
         }
         let output = Command::new("resolvectl").args(&args).output()?;
         if !output.status.success() {
@@ -189,15 +196,19 @@ impl SystemConfig for DirectManager {
         }
 
         // Only create backup when resolv.conf is NOT already EasyTier-managed.
-        // If backup was lost but resolv.conf has our header, skip — backing up
-        // our own output would prevent restoring the real original.
-        if !Path::new(RESOLV_CONF_BACKUP).exists()
-            && Path::new(RESOLV_CONF).exists()
-            && fs::read_to_string(RESOLV_CONF)
-                .map(|c| !c.starts_with(RESOLV_CONF_HEADER))
-                .unwrap_or(false)
-        {
-            fs::copy(RESOLV_CONF, RESOLV_CONF_BACKUP)?;
+        if !Path::new(RESOLV_CONF_BACKUP).exists() && Path::new(RESOLV_CONF).exists() {
+            match fs::read_to_string(RESOLV_CONF) {
+                Ok(c) if c.starts_with(RESOLV_CONF_HEADER) => { /* already ours, skip */ }
+                Ok(_) => {
+                    fs::copy(RESOLV_CONF, RESOLV_CONF_BACKUP)?;
+                }
+                Err(e) => {
+                    return Err(io::Error::other(format!(
+                        "Cannot read /etc/resolv.conf for backup: {}",
+                        e
+                    )));
+                }
+            }
         }
 
         let mut content = String::from(RESOLV_CONF_HEADER);
@@ -278,10 +289,7 @@ impl SystemConfig for DirectManager {
 /// `SystemConfig` implementation.
 pub fn new_os_configurator(interface_name: &str) -> Result<Box<dyn SystemConfig>> {
     let env = new_os_config_env();
-    let mode = dns_mode(&env).unwrap_or_else(|e| {
-        tracing::warn!("dns: failed to detect mode ({}), falling back to direct", e);
-        "direct".to_string()
-    });
+    let mode = dns_mode(&env).context("Failed to detect DNS mode")?;
 
     tracing::info!("dns: using {} mode", mode);
 
