@@ -45,6 +45,7 @@ use hickory_server::server::{Request, RequestHandler, ResponseHandler, ResponseI
 use multimap::MultiMap;
 use pnet::packet::icmp::{IcmpTypes, MutableIcmpPacket};
 use pnet::packet::ipv4::Ipv4Packet;
+use pnet::packet::tcp::{self, MutableTcpPacket, TcpFlags, TcpPacket};
 use pnet::packet::udp::UdpPacket;
 use pnet::packet::{
     icmp,
@@ -78,6 +79,14 @@ impl MagicDnsServerInstanceData {
         routes: T,
         zone: &str,
     ) -> Result<(), anyhow::Error> {
+        // Ensure zone name ends with a dot (FQDN) for correct catalog matching.
+        let zone_fqdn = if zone.ends_with('.') {
+            zone.to_string()
+        } else {
+            format!("{}.", zone)
+        };
+        let zone = zone_fqdn.as_str();
+
         let mut records: Vec<Record> = vec![];
         for route in routes {
             if route.hostname.is_empty() {
@@ -92,7 +101,7 @@ impl MagicDnsServerInstanceData {
                 .rr_type(RecordType::A)
                 .name(format!("{}.{}", route.hostname, zone))
                 .value(ipv4_addr.to_string())
-                .ttl(Duration::from_secs(1))
+                .ttl(Duration::from_secs(15))
                 .build()?;
 
             // check record name valid for dns
@@ -233,9 +242,9 @@ impl MagicDnsServerRpc for MagicDnsServerInstanceData {
             for route in routes.iter().map(|x| x.1) {
                 dns_records.records.push(DnsRecord {
                     record: Some(dns_record::Record::A(DnsRecordA {
-                        name: format!("{}.{}", route.hostname, zone),
+                        name: format!("{}.{}.", route.hostname, zone.trim_end_matches('.')),
                         value: route.ipv4_addr.unwrap_or_default().address,
-                        ttl: 1,
+                        ttl: 15,
                     })),
                 });
             }
@@ -319,6 +328,9 @@ impl MagicDnsServerInstanceData {
             }
             IpNextHeaderProtocols::Icmp => {
                 self.handle_icmp_packet(zc_packet, ip_header_length)?;
+            }
+            IpNextHeaderProtocols::Tcp => {
+                self.handle_tcp_rst(zc_packet, ip_header_length)?;
             }
             _ => {
                 return None;
@@ -434,6 +446,54 @@ impl MagicDnsServerInstanceData {
 
         Some(())
     }
+
+    /// Reply to TCP SYN with RST to signal that TCP DNS is not supported.
+    /// This prevents systemd-resolved from cycling between TCP/UDP feature sets.
+    fn handle_tcp_rst(&self, zc_packet: &mut ZCPacket, ip_header_length: usize) -> Option<()> {
+        let (src_port, dst_port, seq_num) = {
+            let tcp_packet = TcpPacket::new(&zc_packet.payload()[ip_header_length..])?;
+            let dst_port = tcp_packet.get_destination();
+            if dst_port != 53 {
+                return None;
+            }
+            if tcp_packet.get_flags() != TcpFlags::SYN {
+                return None;
+            }
+            (tcp_packet.get_source(), dst_port, tcp_packet.get_sequence())
+        };
+
+        let mut tcp_packet =
+            MutableTcpPacket::new(&mut zc_packet.mut_payload()[ip_header_length..])?;
+        tcp_packet.set_source(dst_port);
+        tcp_packet.set_destination(src_port);
+        tcp_packet.set_acknowledgement(seq_num.wrapping_add(1));
+        tcp_packet.set_sequence(0);
+        tcp_packet.set_flags(TcpFlags::RST | TcpFlags::ACK);
+        tcp_packet.set_data_offset(5);
+        tcp_packet.set_window(0);
+
+        // Truncate any TCP payload/options — RST is header-only.
+        let ip_plus_tcp = ip_header_length + 20;
+        let inner_offset = zc_packet.payload_offset();
+        zc_packet.mut_inner().truncate(inner_offset + ip_plus_tcp);
+
+        // Fix IP total length.
+        let mut ip_packet = MutableIpv4Packet::new(zc_packet.mut_payload())?;
+        ip_packet.set_total_length(ip_plus_tcp as u16);
+
+        // Recompute TCP checksum with the swapped IPs (IPs will be swapped by caller).
+        let src = ip_packet.get_destination();
+        let dst = ip_packet.get_source();
+        // Clear checksum field before computing — pnet includes existing bytes in the calculation.
+        MutableTcpPacket::new(&mut zc_packet.mut_payload()[ip_header_length..])?.set_checksum(0);
+        let tcp_imm =
+            TcpPacket::new(&zc_packet.payload()[ip_header_length..]).expect("TCP packet too short");
+        let cksum = tcp::ipv4_checksum(&tcp_imm, &src, &dst);
+        MutableTcpPacket::new(&mut zc_packet.mut_payload()[ip_header_length..])?
+            .set_checksum(cksum);
+
+        Some(())
+    }
 }
 
 #[async_trait::async_trait]
@@ -506,6 +566,16 @@ fn get_system_config(
         return Ok(Some(Box::new(DarwinConfigurator::new())));
     }
 
+    #[cfg(target_os = "linux")]
+    {
+        use super::system_config::linux;
+        if let Some(tun_name) = _tun_name {
+            return Ok(Some(linux::new_os_configurator(tun_name)?));
+        } else {
+            return Ok(None);
+        }
+    }
+
     #[allow(unreachable_code)]
     Ok(None)
 }
@@ -523,7 +593,14 @@ impl MagicDnsServerInstance {
 
         let dns_config = RunConfigBuilder::default()
             .general(GeneralConfigBuilder::default().build()?)
-            .excluded_forward_nameservers(vec![fake_ip.into()])
+            .excluded_forward_nameservers(vec![
+                fake_ip.into(),
+                // Exclude loopback DNS resolvers to prevent forwarding loops.
+                // On systemd-resolved systems, 127.0.0.53/54 would forward
+                // queries back to us for domains matching our routing domain.
+                std::net::Ipv4Addr::new(127, 0, 0, 53).into(),
+                std::net::Ipv4Addr::new(127, 0, 0, 54).into(),
+            ])
             .build()?;
         let mut dns_server = Server::new(dns_config);
         dns_server.run().await?;
