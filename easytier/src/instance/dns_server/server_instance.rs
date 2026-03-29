@@ -452,14 +452,14 @@ impl MagicDnsServerInstanceData {
     fn handle_tcp_rst(&self, zc_packet: &mut ZCPacket, ip_header_length: usize) -> Option<()> {
         let (src_port, dst_port, seq_num) = {
             let tcp_packet = TcpPacket::new(&zc_packet.payload()[ip_header_length..])?;
-            if tcp_packet.get_flags() & TcpFlags::SYN == 0 {
+            let dst_port = tcp_packet.get_destination();
+            if dst_port != 53 {
                 return None;
             }
-            (
-                tcp_packet.get_source(),
-                tcp_packet.get_destination(),
-                tcp_packet.get_sequence(),
-            )
+            if tcp_packet.get_flags() != TcpFlags::SYN {
+                return None;
+            }
+            (tcp_packet.get_source(), dst_port, tcp_packet.get_sequence())
         };
 
         let mut tcp_packet =

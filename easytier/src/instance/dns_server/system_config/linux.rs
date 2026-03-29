@@ -343,15 +343,13 @@ pub fn resolvconf_style() -> String {
 
     let output = match Command::new("resolvconf").arg("--version").output() {
         Ok(output) => output,
-        Err(e) => {
-            if let Some(code) = e.raw_os_error() {
-                if code == 99 {
-                    return "debian".to_string();
-                }
-            }
-            return String::new();
-        }
+        Err(_) => return String::new(),
     };
+
+    // Debian resolvconf exits with code 99 for --version
+    if output.status.code() == Some(99) {
+        return "debian".to_string();
+    }
 
     if output.stdout.starts_with(b"Debian resolvconf") {
         return "debian".to_string();
