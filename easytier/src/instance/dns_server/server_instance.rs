@@ -242,7 +242,7 @@ impl MagicDnsServerRpc for MagicDnsServerInstanceData {
             for route in routes.iter().map(|x| x.1) {
                 dns_records.records.push(DnsRecord {
                     record: Some(dns_record::Record::A(DnsRecordA {
-                        name: format!("{}.{}", route.hostname, zone),
+                        name: format!("{}.{}", route.hostname, zone.trim_end_matches('.')),
                         value: route.ipv4_addr.unwrap_or_default().address,
                         ttl: 15,
                     })),
@@ -484,8 +484,10 @@ impl MagicDnsServerInstanceData {
         // Recompute TCP checksum with the swapped IPs (IPs will be swapped by caller).
         let src = ip_packet.get_destination();
         let dst = ip_packet.get_source();
+        // Clear checksum field before computing — pnet includes existing bytes in the calculation.
+        MutableTcpPacket::new(&mut zc_packet.mut_payload()[ip_header_length..])?.set_checksum(0);
         let tcp_imm =
-            TcpPacket::new(ip_packet.payload()).expect("TCP packet too short for checksum");
+            TcpPacket::new(&zc_packet.payload()[ip_header_length..]).expect("TCP packet too short");
         let cksum = tcp::ipv4_checksum(&tcp_imm, &src, &dst);
         MutableTcpPacket::new(&mut zc_packet.mut_payload()[ip_header_length..])?
             .set_checksum(cksum);

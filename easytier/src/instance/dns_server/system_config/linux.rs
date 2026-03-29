@@ -160,12 +160,18 @@ impl SystemConfig for DirectManager {
             if !original.starts_with(RESOLV_CONF_HEADER) {
                 for line in original.lines() {
                     let trimmed = line.trim();
-                    if let Some(ns) = trimmed.strip_prefix("nameserver ") {
+                    if let Some(ns) = trimmed
+                        .strip_prefix("nameserver")
+                        .and_then(|s| s.strip_prefix(|c: char| c.is_whitespace()))
+                    {
                         let ns = ns.trim();
                         if !ns.is_empty() {
                             orig_nameservers.push(ns.to_string());
                         }
-                    } else if let Some(s) = trimmed.strip_prefix("search ") {
+                    } else if let Some(s) = trimmed
+                        .strip_prefix("search")
+                        .and_then(|s| s.strip_prefix(|c: char| c.is_whitespace()))
+                    {
                         orig_search.extend(s.split_whitespace().map(String::from));
                     } else if !trimmed.is_empty() && !trimmed.starts_with('#') {
                         // Preserve options, domain, sortlist, etc.
@@ -243,6 +249,9 @@ impl SystemConfig for DirectManager {
         if Path::new(RESOLV_CONF_BACKUP).exists() {
             fs::copy(RESOLV_CONF_BACKUP, RESOLV_CONF)?;
             fs::remove_file(RESOLV_CONF_BACKUP)?;
+        } else {
+            // No backup means resolv.conf didn't exist before we created it.
+            let _ = fs::remove_file(RESOLV_CONF);
         }
         Ok(())
     }
