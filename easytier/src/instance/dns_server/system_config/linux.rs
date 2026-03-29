@@ -151,21 +151,25 @@ impl DirectManager {
 
 impl SystemConfig for DirectManager {
     fn set_dns(&self, cfg: &OSConfig) -> io::Result<()> {
-        // Read original resolv.conf to preserve existing nameservers and search
-        // domains so that normal internet access is not disrupted.
-        let (mut orig_nameservers, mut orig_search) = (Vec::new(), Vec::new());
+        // Read original resolv.conf to preserve existing nameservers, search
+        // domains, and other directives so resolver behavior is not disrupted.
+        let (mut orig_nameservers, mut orig_search, mut orig_other) =
+            (Vec::new(), Vec::new(), Vec::new());
         if let Ok(original) = fs::read_to_string(RESOLV_CONF) {
             // Don't re-parse our own output on repeated calls.
             if !original.starts_with(RESOLV_CONF_HEADER) {
                 for line in original.lines() {
-                    let line = line.trim();
-                    if let Some(ns) = line.strip_prefix("nameserver ") {
+                    let trimmed = line.trim();
+                    if let Some(ns) = trimmed.strip_prefix("nameserver ") {
                         let ns = ns.trim();
                         if !ns.is_empty() {
                             orig_nameservers.push(ns.to_string());
                         }
-                    } else if let Some(s) = line.strip_prefix("search ") {
+                    } else if let Some(s) = trimmed.strip_prefix("search ") {
                         orig_search.extend(s.split_whitespace().map(String::from));
+                    } else if !trimmed.is_empty() && !trimmed.starts_with('#') {
+                        // Preserve options, domain, sortlist, etc.
+                        orig_other.push(line.to_string());
                     }
                 }
             }
@@ -207,6 +211,12 @@ impl SystemConfig for DirectManager {
         }
         if !all_domains.is_empty() {
             content.push_str(&format!("search {}\n", all_domains.join(" ")));
+        }
+
+        // Preserve other directives (options, domain, sortlist, etc.)
+        for line in &orig_other {
+            content.push_str(line);
+            content.push('\n');
         }
 
         fs::write(RESOLV_CONF, content)?;
@@ -536,6 +546,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore] // Depends on host environment (D-Bus, /etc/resolv.conf); not suitable for CI.
     fn dns_mode_test() {
         let env = new_os_config_env();
         let mode = dns_mode(&env).unwrap();
@@ -571,11 +582,7 @@ mod tests {
     #[test]
     fn test_direct_manager_set_and_close() {
         let dir = tempfile::tempdir().unwrap();
-        let resolv_path = dir.path().join("resolv.conf");
-        let backup_path = dir.path().join("resolv.conf.bak");
-
-        // Write an original resolv.conf
-        fs::write(&resolv_path, "nameserver 8.8.8.8\n").unwrap();
+        let _resolv_path = dir.path().join("resolv.conf");
 
         // We can't easily test DirectManager with const paths, but we can
         // verify the logic by testing the OSConfig construction.

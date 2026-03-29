@@ -80,12 +80,12 @@ impl MagicDnsServerInstanceData {
         zone: &str,
     ) -> Result<(), anyhow::Error> {
         // Ensure zone name ends with a dot (FQDN) for correct catalog matching.
-        let zone = if zone.ends_with('.') {
+        let zone_fqdn = if zone.ends_with('.') {
             zone.to_string()
         } else {
             format!("{}.", zone)
         };
-        let zone = zone.as_str();
+        let zone = zone_fqdn.as_str();
 
         let mut records: Vec<Record> = vec![];
         for route in routes {
