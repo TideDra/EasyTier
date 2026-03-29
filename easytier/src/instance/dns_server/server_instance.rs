@@ -45,6 +45,7 @@ use hickory_server::server::{Request, RequestHandler, ResponseHandler, ResponseI
 use multimap::MultiMap;
 use pnet::packet::icmp::{IcmpTypes, MutableIcmpPacket};
 use pnet::packet::ipv4::Ipv4Packet;
+use pnet::packet::tcp::{self, MutableTcpPacket, TcpFlags, TcpPacket};
 use pnet::packet::udp::UdpPacket;
 use pnet::packet::{
     icmp,
@@ -328,6 +329,9 @@ impl MagicDnsServerInstanceData {
             IpNextHeaderProtocols::Icmp => {
                 self.handle_icmp_packet(zc_packet, ip_header_length)?;
             }
+            IpNextHeaderProtocols::Tcp => {
+                self.handle_tcp_rst(zc_packet, ip_header_length)?;
+            }
             _ => {
                 return None;
             }
@@ -442,6 +446,52 @@ impl MagicDnsServerInstanceData {
 
         Some(())
     }
+
+    /// Reply to TCP SYN with RST to signal that TCP DNS is not supported.
+    /// This prevents systemd-resolved from cycling between TCP/UDP feature sets.
+    fn handle_tcp_rst(&self, zc_packet: &mut ZCPacket, ip_header_length: usize) -> Option<()> {
+        let (src_port, dst_port, seq_num) = {
+            let tcp_packet = TcpPacket::new(&zc_packet.payload()[ip_header_length..])?;
+            if tcp_packet.get_flags() & TcpFlags::SYN == 0 {
+                return None;
+            }
+            (
+                tcp_packet.get_source(),
+                tcp_packet.get_destination(),
+                tcp_packet.get_sequence(),
+            )
+        };
+
+        let mut tcp_packet =
+            MutableTcpPacket::new(&mut zc_packet.mut_payload()[ip_header_length..])?;
+        tcp_packet.set_source(dst_port);
+        tcp_packet.set_destination(src_port);
+        tcp_packet.set_acknowledgement(seq_num.wrapping_add(1));
+        tcp_packet.set_sequence(0);
+        tcp_packet.set_flags(TcpFlags::RST | TcpFlags::ACK);
+        tcp_packet.set_data_offset(5);
+        tcp_packet.set_window(0);
+
+        // Truncate any TCP payload/options — RST is header-only.
+        let ip_plus_tcp = ip_header_length + 20;
+        let inner_offset = zc_packet.payload_offset();
+        zc_packet.mut_inner().truncate(inner_offset + ip_plus_tcp);
+
+        // Fix IP total length.
+        let mut ip_packet = MutableIpv4Packet::new(zc_packet.mut_payload())?;
+        ip_packet.set_total_length(ip_plus_tcp as u16);
+
+        // Recompute TCP checksum with the swapped IPs (IPs will be swapped by caller).
+        let src = ip_packet.get_destination();
+        let dst = ip_packet.get_source();
+        let tcp_imm =
+            TcpPacket::new(ip_packet.payload()).expect("TCP packet too short for checksum");
+        let cksum = tcp::ipv4_checksum(&tcp_imm, &dst, &src);
+        MutableTcpPacket::new(&mut zc_packet.mut_payload()[ip_header_length..])?
+            .set_checksum(cksum);
+
+        Some(())
+    }
 }
 
 #[async_trait::async_trait]
@@ -538,7 +588,14 @@ impl MagicDnsServerInstance {
 
         let dns_config = RunConfigBuilder::default()
             .general(GeneralConfigBuilder::default().build()?)
-            .excluded_forward_nameservers(vec![fake_ip.into()])
+            .excluded_forward_nameservers(vec![
+                fake_ip.into(),
+                // Exclude loopback DNS resolvers to prevent forwarding loops.
+                // On systemd-resolved systems, 127.0.0.53/54 would forward
+                // queries back to us for domains matching our routing domain.
+                std::net::Ipv4Addr::new(127, 0, 0, 53).into(),
+                std::net::Ipv4Addr::new(127, 0, 0, 54).into(),
+            ])
             .build()?;
         let mut dns_server = Server::new(dns_config);
         dns_server.run().await?;
