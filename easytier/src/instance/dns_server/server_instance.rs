@@ -242,7 +242,7 @@ impl MagicDnsServerRpc for MagicDnsServerInstanceData {
             for route in routes.iter().map(|x| x.1) {
                 dns_records.records.push(DnsRecord {
                     record: Some(dns_record::Record::A(DnsRecordA {
-                        name: format!("{}.{}", route.hostname, zone.trim_end_matches('.')),
+                        name: format!("{}.{}.", route.hostname, zone.trim_end_matches('.')),
                         value: route.ipv4_addr.unwrap_or_default().address,
                         ttl: 15,
                     })),

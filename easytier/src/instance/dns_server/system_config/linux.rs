@@ -188,9 +188,15 @@ impl SystemConfig for DirectManager {
             }
         }
 
-        // Only create backup if one doesn't already exist (avoid overwriting
-        // the original with our modified version on repeated calls).
-        if !Path::new(RESOLV_CONF_BACKUP).exists() && Path::new(RESOLV_CONF).exists() {
+        // Only create backup when resolv.conf is NOT already EasyTier-managed.
+        // If backup was lost but resolv.conf has our header, skip — backing up
+        // our own output would prevent restoring the real original.
+        if !Path::new(RESOLV_CONF_BACKUP).exists()
+            && Path::new(RESOLV_CONF).exists()
+            && fs::read_to_string(RESOLV_CONF)
+                .map(|c| !c.starts_with(RESOLV_CONF_HEADER))
+                .unwrap_or(false)
+        {
             fs::copy(RESOLV_CONF, RESOLV_CONF_BACKUP)?;
         }
 
