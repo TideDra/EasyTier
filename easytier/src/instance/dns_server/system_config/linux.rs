@@ -67,6 +67,8 @@ impl SystemConfig for ResolvedManager {
         }
         let output = Command::new("resolvectl").args(&args).output()?;
         if !output.status.success() {
+            // Revert DNS settings so config isn't left partially applied.
+            self.close().ok();
             return Err(io::Error::other(format!(
                 "resolvectl domain failed: {}",
                 String::from_utf8_lossy(&output.stderr)
@@ -126,6 +128,8 @@ impl SystemConfig for ResolvconfManager {
         if let Some(ref mut stdin) = child.stdin {
             stdin.write_all(content.as_bytes())?;
         }
+        // Close stdin so resolvconf reads EOF and proceeds.
+        drop(child.stdin.take());
 
         let output = child.wait_with_output()?;
         if !output.status.success() {
