@@ -244,7 +244,7 @@ impl MagicDnsServerRpc for MagicDnsServerInstanceData {
                     record: Some(dns_record::Record::A(DnsRecordA {
                         name: format!("{}.{}", route.hostname, zone),
                         value: route.ipv4_addr.unwrap_or_default().address,
-                        ttl: 1,
+                        ttl: 15,
                     })),
                 });
             }
@@ -486,7 +486,7 @@ impl MagicDnsServerInstanceData {
         let dst = ip_packet.get_source();
         let tcp_imm =
             TcpPacket::new(ip_packet.payload()).expect("TCP packet too short for checksum");
-        let cksum = tcp::ipv4_checksum(&tcp_imm, &dst, &src);
+        let cksum = tcp::ipv4_checksum(&tcp_imm, &src, &dst);
         MutableTcpPacket::new(&mut zc_packet.mut_payload()[ip_header_length..])?
             .set_checksum(cksum);
 
@@ -567,8 +567,11 @@ fn get_system_config(
     #[cfg(target_os = "linux")]
     {
         use super::system_config::linux;
-        let tun_name = _tun_name.ok_or_else(|| anyhow::anyhow!("No tun name"))?;
-        return Ok(Some(linux::new_os_configurator(tun_name)?));
+        if let Some(tun_name) = _tun_name {
+            return Ok(Some(linux::new_os_configurator(tun_name)?));
+        } else {
+            return Ok(None);
+        }
     }
 
     #[allow(unreachable_code)]

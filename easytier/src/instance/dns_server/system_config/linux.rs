@@ -213,8 +213,17 @@ impl SystemConfig for DirectManager {
             content.push_str(&format!("search {}\n", all_domains.join(" ")));
         }
 
-        // Preserve other directives (options, domain, sortlist, etc.)
+        // Preserve other directives (options, sortlist, etc.)
+        // Filter out `domain` when we emit `search` — resolv.conf honors the
+        // last of domain/search, so a stale `domain` would override ours.
+        let have_search = !all_domains.is_empty();
         for line in &orig_other {
+            if have_search {
+                let trimmed = line.trim_start();
+                if trimmed.starts_with("domain ") || trimmed.starts_with("domain\t") {
+                    continue;
+                }
+            }
             content.push_str(line);
             content.push('\n');
         }
@@ -580,7 +589,7 @@ mod tests {
     }
 
     #[test]
-    fn test_direct_manager_set_and_close() {
+    fn test_os_config_construction() {
         let dir = tempfile::tempdir().unwrap();
         let _resolv_path = dir.path().join("resolv.conf");
 
