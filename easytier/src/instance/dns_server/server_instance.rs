@@ -78,6 +78,14 @@ impl MagicDnsServerInstanceData {
         routes: T,
         zone: &str,
     ) -> Result<(), anyhow::Error> {
+        // Ensure zone name ends with a dot (FQDN) for correct catalog matching.
+        let zone = if zone.ends_with('.') {
+            zone.to_string()
+        } else {
+            format!("{}.", zone)
+        };
+        let zone = zone.as_str();
+
         let mut records: Vec<Record> = vec![];
         for route in routes {
             if route.hostname.is_empty() {
@@ -92,7 +100,7 @@ impl MagicDnsServerInstanceData {
                 .rr_type(RecordType::A)
                 .name(format!("{}.{}", route.hostname, zone))
                 .value(ipv4_addr.to_string())
-                .ttl(Duration::from_secs(1))
+                .ttl(Duration::from_secs(15))
                 .build()?;
 
             // check record name valid for dns
