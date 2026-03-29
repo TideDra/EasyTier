@@ -155,28 +155,35 @@ impl SystemConfig for DirectManager {
         // domains, and other directives so resolver behavior is not disrupted.
         let (mut orig_nameservers, mut orig_search, mut orig_other) =
             (Vec::new(), Vec::new(), Vec::new());
-        if let Ok(original) = fs::read_to_string(RESOLV_CONF) {
-            // Don't re-parse our own output on repeated calls.
-            if !original.starts_with(RESOLV_CONF_HEADER) {
-                for line in original.lines() {
-                    let trimmed = line.trim();
-                    if let Some(ns) = trimmed
-                        .strip_prefix("nameserver")
-                        .and_then(|s| s.strip_prefix(|c: char| c.is_whitespace()))
-                    {
-                        let ns = ns.trim();
-                        if !ns.is_empty() {
-                            orig_nameservers.push(ns.to_string());
-                        }
-                    } else if let Some(s) = trimmed
-                        .strip_prefix("search")
-                        .and_then(|s| s.strip_prefix(|c: char| c.is_whitespace()))
-                    {
-                        orig_search.extend(s.split_whitespace().map(String::from));
-                    } else if !trimmed.is_empty() && !trimmed.starts_with('#') {
-                        // Preserve options, domain, sortlist, etc.
-                        orig_other.push(line.to_string());
+        // On repeated calls our own header is present — read from the backup instead.
+        let source = if Path::new(RESOLV_CONF)
+            .exists()
+            .then(|| fs::read_to_string(RESOLV_CONF).ok())
+            .flatten()
+            .is_some_and(|c| c.starts_with(RESOLV_CONF_HEADER))
+        {
+            fs::read_to_string(RESOLV_CONF_BACKUP).ok()
+        } else {
+            fs::read_to_string(RESOLV_CONF).ok()
+        };
+        if let Some(original) = source {
+            for line in original.lines() {
+                let trimmed = line.trim();
+                if let Some(ns) = trimmed
+                    .strip_prefix("nameserver")
+                    .and_then(|s| s.strip_prefix(|c: char| c.is_whitespace()))
+                {
+                    let ns = ns.trim();
+                    if !ns.is_empty() {
+                        orig_nameservers.push(ns.to_string());
                     }
+                } else if let Some(s) = trimmed
+                    .strip_prefix("search")
+                    .and_then(|s| s.strip_prefix(|c: char| c.is_whitespace()))
+                {
+                    orig_search.extend(s.split_whitespace().map(String::from));
+                } else if !trimmed.is_empty() && !trimmed.starts_with('#') {
+                    orig_other.push(line.to_string());
                 }
             }
         }
@@ -431,11 +438,15 @@ fn dns_mode(env: &OSConfigEnv) -> Result<String> {
 
     let content = match env.fs.read_file(RESOLV_CONF) {
         Ok(content) => content,
-        Err(e) if e.to_string().contains("NotFound") => {
-            dbg("rc", "missing");
-            return Ok("direct".to_string());
+        Err(e) => {
+            if e.downcast_ref::<std::io::Error>()
+                .is_some_and(|io_err| io_err.kind() == std::io::ErrorKind::NotFound)
+            {
+                dbg("rc", "missing");
+                return Ok("direct".to_string());
+            }
+            return Err(e).context("reading /etc/resolv.conf");
         }
-        Err(e) => return Err(e).context("reading /etc/resolv.conf"),
     };
 
     match resolv_owner(&content).as_str() {
