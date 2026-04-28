@@ -10,7 +10,7 @@ initial_nodes_help: |
   • 留空 = 节点独立启动，等别人来连，或你后续手动连。
   • 无论直接还是间接连通（通过其他节点搭桥），都能组网互通。
   初始节点可以用自己的，也可以用别人分享的。
-initial_node_placeholder: 例如：tcp://node.example.com:11010
+initial_node_placeholder: 例如：node.example.com
 virtual_ipv4: 虚拟IPv4地址
 virtual_ipv4_dhcp: DHCP
 network_name: 网络名称
@@ -117,7 +117,7 @@ disable_quic_input: 禁用 QUIC 输入
 disable_quic_input_help: 禁用 QUIC 入站流量，其他开启 QUIC 代理的节点仍然使用 TCP 连接到本节点。
 
 disable_p2p: 禁用 P2P
-disable_p2p_help: 禁用 P2P 模式，所有流量通过手动指定的服务器中转。
+disable_p2p_help: 禁用普通自动 P2P。开启 need-p2p 的节点仍可与当前节点建立 P2P。
 
 p2p_only: 仅 P2P
 p2p_only_help: 仅与已经建立P2P连接的对等节点通信，不通过其他节点中转。
@@ -195,6 +195,12 @@ mtu: MTU
 mtu_help: |
   TUN设备的MTU，默认为非加密时为1380，加密时为1360。范围：400-1380
 mtu_placeholder: 留空为默认值1380
+
+instance_recv_bps_limit: 实例接收限速
+instance_recv_bps_limit_help: |
+  限制当前实例整体入站流量的总接收速率，单位为字节每秒。
+  留空表示不限速。
+instance_recv_bps_limit_placeholder: 留空表示不限速
 
 mapped_listeners: 监听映射
 mapped_listeners_help: |
@@ -349,6 +355,7 @@ web:
     delete: 删除
     edit: 编辑
     refresh: 刷新
+    add: 添加
     loading: 加载中...
     error: 错误
     success: 成功
@@ -416,3 +423,46 @@ config-server:
 client:
   not_running: 无法连接至远程客户端
   retry: 重试
+
+acl:
+  title: 访问控制
+  help: 访问控制列表，用于限制节点间的通信。
+  enabled: 启用 ACL
+  default_action: 默认动作
+  chains: 规则链
+  inbound: 入站
+  outbound: 出站
+  forward: 转发
+  rules: 规则
+  add_rule: 添加规则
+  edit_rule: 编辑规则
+  rule:
+    name: 规则名称
+    description: 描述
+    enabled: 启用
+    protocol: 协议
+    action: 动作
+    src_ips: 来源 IP
+    dst_ips: 目的 IP
+    src_ports: 来源端口
+    dst_ports: 目的端口
+    rate_limit: 速率限制 (pps)
+    burst_limit: 爆发限制
+    stateful: 状态追踪
+    src_groups: 来源组
+    dst_groups: 目的组
+  groups: 组管理
+  group:
+    declares: 声明组
+    members: 加入组
+    name: 组名
+    secret: 密钥
+    help: 在此处定义网络中的组身份，以便在规则中使用。
+  any: 任意
+  allow: 允许
+  drop: 丢弃
+  delete_chain_confirm: 确定要删除此规则链及其所有规则吗？
+  chain:
+    name: 名称
+    type: 类型
+  match: 匹配

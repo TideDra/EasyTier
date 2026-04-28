@@ -1,12 +1,15 @@
-use crate::common::config::{process_secure_mode_cfg, ConfigFileControl, PortForwardConfig};
+use crate::common::config::{
+    ConfigFileControl, ConfigSource, PortForwardConfig, parse_mapped_listener_urls,
+    process_secure_mode_cfg,
+};
 use crate::proto::api::{self, manage};
 use crate::proto::rpc_types::controller::BaseController;
 use crate::rpc_service::InstanceRpcService;
 use crate::{
     common::{
         config::{
-            gen_default_flags, ConfigLoader, NetworkIdentity, PeerConfig, TomlConfigLoader,
-            VpnPortalConfig,
+            ConfigLoader, NetworkIdentity, PeerConfig, TomlConfigLoader, VpnPortalConfig,
+            gen_default_flags,
         },
         constants::EASYTIER_VERSION,
         global_ctx::{EventBusSubscriber, GlobalCtxEvent},
@@ -19,7 +22,7 @@ use chrono::{DateTime, Local};
 use std::{
     collections::VecDeque,
     net::SocketAddr,
-    sync::{atomic::AtomicBool, Arc, Mutex, RwLock},
+    sync::{Arc, Mutex, RwLock, atomic::AtomicBool},
 };
 use tokio::{
     sync::{broadcast, mpsc},
@@ -93,11 +96,7 @@ impl EasyTierLauncher {
         }
     }
 
-    #[cfg(any(
-        target_os = "android",
-        any(target_os = "ios", all(target_os = "macos", feature = "macos-ne")),
-        target_env = "ohos"
-    ))]
+    #[cfg(mobile)]
     async fn run_routine_for_mobile(
         instance: &Instance,
         data: &EasyTierData,
@@ -156,11 +155,7 @@ impl EasyTierLauncher {
             }
         });
 
-        #[cfg(any(
-            target_os = "android",
-            any(target_os = "ios", all(target_os = "macos", feature = "macos-ne")),
-            target_env = "ohos"
-        ))]
+        #[cfg(mobile)]
         Self::run_routine_for_mobile(&instance, &data, &mut tasks).await;
 
         instance.run().await?;
@@ -280,10 +275,10 @@ impl Drop for EasyTierLauncher {
     fn drop(&mut self) {
         self.stop_flag
             .store(true, std::sync::atomic::Ordering::Relaxed);
-        if let Some(handle) = self.thread_handle.take() {
-            if let Err(e) = handle.join() {
-                println!("Error when joining thread: {:?}", e);
-            }
+        if let Some(handle) = self.thread_handle.take()
+            && let Err(e) = handle.join()
+        {
+            println!("Error when joining thread: {:?}", e);
         }
     }
 }
@@ -403,12 +398,6 @@ impl NetworkInstance {
         self.config.get_network_identity().network_name
     }
 
-    pub fn set_tun_fd(&mut self, tun_fd: i32) {
-        if let Some(launcher) = self.launcher.as_ref() {
-            let _ = launcher.data.tun_fd.0.blocking_send(Some(tun_fd));
-        }
-    }
-
     pub fn get_tun_fd_sender(&self) -> Option<mpsc::Sender<TunFd>> {
         self.launcher
             .as_ref()
@@ -446,6 +435,10 @@ impl NetworkInstance {
 
     pub fn get_config_file_control(&self) -> &ConfigFileControl {
         &self.config_file_control
+    }
+
+    pub fn get_network_config_source(&self) -> ConfigSource {
+        self.config.get_network_config_source()
     }
 
     pub fn get_latest_error_msg(&self) -> Option<String> {
@@ -573,8 +566,9 @@ impl NetworkConfig {
                         peer_public_key: None,
                     });
                 }
-
-                cfg.set_peers(peers);
+                if !peers.is_empty() {
+                    cfg.set_peers(peers);
+                }
             }
             NetworkingMethod::Standalone => {}
         }
@@ -669,31 +663,17 @@ impl NetworkConfig {
             cfg.set_exit_nodes(exit_nodes);
         }
 
-        if self.enable_socks5.unwrap_or_default() {
-            if let Some(socks5_port) = self.socks5_port {
-                cfg.set_socks5_portal(Some(
-                    format!("socks5://0.0.0.0:{}", socks5_port).parse().unwrap(),
-                ));
-            }
+        if self.enable_socks5.unwrap_or_default()
+            && let Some(socks5_port) = self.socks5_port
+        {
+            cfg.set_socks5_portal(Some(
+                format!("socks5://0.0.0.0:{}", socks5_port).parse().unwrap(),
+            ));
         }
 
         if !self.mapped_listeners.is_empty() {
-            cfg.set_mapped_listeners(Some(
-                self.mapped_listeners
-                    .iter()
-                    .map(|s| {
-                        s.parse()
-                            .with_context(|| format!("mapped listener is not a valid url: {}", s))
-                            .unwrap()
-                    })
-                    .map(|s: url::Url| {
-                        if s.port().is_none() {
-                            panic!("mapped listener port is missing: {}", s);
-                        }
-                        s
-                    })
-                    .collect(),
-            ));
+            let mapped_listeners = parse_mapped_listener_urls(&self.mapped_listeners)?;
+            cfg.set_mapped_listeners(Some(mapped_listeners));
         }
 
         if let Some(credential_file) = self
@@ -732,6 +712,24 @@ impl NetworkConfig {
 
         if let Some(use_smoltcp) = self.use_smoltcp {
             flags.use_smoltcp = use_smoltcp;
+        }
+
+        if let Some(ipv6_public_addr_provider) = self.ipv6_public_addr_provider {
+            cfg.set_ipv6_public_addr_provider(ipv6_public_addr_provider);
+        }
+
+        if let Some(ipv6_public_addr_auto) = self.ipv6_public_addr_auto {
+            cfg.set_ipv6_public_addr_auto(ipv6_public_addr_auto);
+        }
+
+        if let Some(ipv6_public_addr_prefix) = self
+            .ipv6_public_addr_prefix
+            .as_ref()
+            .filter(|prefix| !prefix.is_empty())
+        {
+            cfg.set_ipv6_public_addr_prefix(Some(ipv6_public_addr_prefix.parse().with_context(
+                || format!("failed to parse ipv6 public address prefix: {ipv6_public_addr_prefix}"),
+            )?));
         }
 
         if let Some(disable_ipv6) = self.disable_ipv6 {
@@ -814,6 +812,10 @@ impl NetworkConfig {
             flags.disable_udp_hole_punching = disable_udp_hole_punching;
         }
 
+        if let Some(disable_upnp) = self.disable_upnp {
+            flags.disable_upnp = disable_upnp;
+        }
+
         if let Some(disable_sym_hole_punching) = self.disable_sym_hole_punching {
             flags.disable_sym_hole_punching = disable_sym_hole_punching;
         }
@@ -826,12 +828,22 @@ impl NetworkConfig {
             flags.mtu = mtu as u32;
         }
 
+        if let Some(instance_recv_bps_limit) = self.instance_recv_bps_limit {
+            flags.instance_recv_bps_limit = instance_recv_bps_limit;
+        }
+
         if let Some(enable_private_mode) = self.enable_private_mode {
             flags.private_mode = enable_private_mode;
         }
 
         if let Some(encryption_algorithm) = self.encryption_algorithm.clone() {
             flags.encryption_algorithm = encryption_algorithm;
+        }
+
+        if let Some(acl) = self.acl.as_ref()
+            && !acl.is_empty()
+        {
+            cfg.set_acl(Some(acl.clone()));
         }
 
         if let Some(data_compress_algo) = self.data_compress_algo {
@@ -869,19 +881,21 @@ impl NetworkConfig {
             result.network_length = Some(ipv4.network_length() as i32);
         }
 
+        if config.get_ipv6_public_addr_provider() != default_config.get_ipv6_public_addr_provider()
+        {
+            result.ipv6_public_addr_provider = Some(config.get_ipv6_public_addr_provider());
+        }
+        if config.get_ipv6_public_addr_auto() != default_config.get_ipv6_public_addr_auto() {
+            result.ipv6_public_addr_auto = Some(config.get_ipv6_public_addr_auto());
+        }
+        result.ipv6_public_addr_prefix = config
+            .get_ipv6_public_addr_prefix()
+            .map(|prefix| prefix.to_string());
+
         let peers = config.get_peers();
-        match peers.len() {
-            1 => {
-                result.networking_method = Some(NetworkingMethod::PublicServer as i32);
-                result.public_server_url = Some(peers[0].uri.to_string());
-            }
-            0 => {
-                result.networking_method = Some(NetworkingMethod::Standalone as i32);
-            }
-            _ => {
-                result.networking_method = Some(NetworkingMethod::Manual as i32);
-                result.peer_urls = peers.iter().map(|p| p.uri.to_string()).collect();
-            }
+        result.networking_method = Some(NetworkingMethod::Manual as i32);
+        if !peers.is_empty() {
+            result.peer_urls = peers.iter().map(|p| p.uri.to_string()).collect();
         }
 
         result.listener_urls = config
@@ -927,11 +941,11 @@ impl NetworkConfig {
             result.vpn_portal_listen_port = Some(vpn_config.wireguard_listen.port() as i32);
         }
 
-        if let Some(routes) = config.get_routes() {
-            if !routes.is_empty() {
-                result.enable_manual_routes = Some(true);
-                result.routes = routes.iter().map(|r| r.to_string()).collect();
-            }
+        if let Some(routes) = config.get_routes()
+            && !routes.is_empty()
+        {
+            result.enable_manual_routes = Some(true);
+            result.routes = routes.iter().map(|r| r.to_string()).collect();
         }
 
         let exit_nodes = config.get_exit_nodes();
@@ -975,10 +989,15 @@ impl NetworkConfig {
         result.disable_encryption = Some(!flags.enable_encryption);
         result.disable_tcp_hole_punching = Some(flags.disable_tcp_hole_punching);
         result.disable_udp_hole_punching = Some(flags.disable_udp_hole_punching);
+        result.disable_upnp = Some(flags.disable_upnp);
         result.disable_sym_hole_punching = Some(flags.disable_sym_hole_punching);
         result.enable_magic_dns = Some(flags.accept_dns);
         result.mtu = Some(flags.mtu as i32);
+        result.instance_recv_bps_limit =
+            (flags.instance_recv_bps_limit != u64::MAX).then_some(flags.instance_recv_bps_limit);
         result.enable_private_mode = Some(flags.private_mode);
+
+        result.acl = config.get_acl();
 
         if flags.relay_network_whitelist == "*" {
             result.enable_relay_network_whitelist = Some(false);
@@ -1002,10 +1021,10 @@ impl NetworkConfig {
 #[cfg(test)]
 mod tests {
     use crate::{
-        common::config::{process_secure_mode_cfg, ConfigLoader},
+        common::config::{ConfigLoader, process_secure_mode_cfg},
         proto::common::SecureModeConfig,
     };
-    use base64::prelude::{Engine as _, BASE64_STANDARD};
+    use base64::prelude::{BASE64_STANDARD, Engine as _};
     use rand::Rng;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -1030,9 +1049,12 @@ mod tests {
         let generated_config_str = generated_config.dump();
 
         assert_eq!(
-                config_str, generated_config_str,
-                "Generated config does not match original config:\nOriginal:\n{}\n\nGenerated:\n{}\nNetwork Config: {}\n",
-                config_str, generated_config_str, serde_json::to_string(&network_config).unwrap()
+            config_str,
+            generated_config_str,
+            "Generated config does not match original config:\nOriginal:\n{}\n\nGenerated:\n{}\nNetwork Config: {}\n",
+            config_str,
+            generated_config_str,
+            serde_json::to_string(&network_config).unwrap()
         );
         Ok(())
     }
@@ -1049,13 +1071,13 @@ mod tests {
             config.set_dhcp(rng.gen_bool(0.5));
 
             if rng.gen_bool(0.7) {
-                let hostname = format!("host-{}", rng.gen::<u16>());
+                let hostname = format!("host-{}", rng.r#gen::<u16>());
                 config.set_hostname(Some(hostname));
             }
 
             config.set_network_identity(crate::common::config::NetworkIdentity::new(
-                format!("network-{}", rng.gen::<u16>()),
-                format!("secret-{}", rng.gen::<u64>()),
+                format!("network-{}", rng.r#gen::<u16>()),
+                format!("secret-{}", rng.r#gen::<u64>()),
             ));
             config.set_inst_name(config.get_network_identity().network_name.clone());
 
@@ -1235,6 +1257,7 @@ mod tests {
                 flags.enable_encryption = rng.gen_bool(0.8);
                 flags.disable_tcp_hole_punching = rng.gen_bool(0.2);
                 flags.disable_udp_hole_punching = rng.gen_bool(0.2);
+                flags.disable_upnp = rng.gen_bool(0.2);
                 flags.accept_dns = rng.gen_bool(0.6);
                 flags.mtu = rng.gen_range(1200..1500);
                 flags.private_mode = rng.gen_bool(0.3);
@@ -1267,9 +1290,12 @@ mod tests {
             let generated_config_str = generated_config.dump();
 
             assert_eq!(
-                config_str, generated_config_str,
+                config_str,
+                generated_config_str,
                 "Generated config does not match original config:\nOriginal:\n{}\n\nGenerated:\n{}\nNetwork Config: {}\n",
-                config_str, generated_config_str, serde_json::to_string(&network_config).unwrap()
+                config_str,
+                generated_config_str,
+                serde_json::to_string(&network_config).unwrap()
             );
         }
 

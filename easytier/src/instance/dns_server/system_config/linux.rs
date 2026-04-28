@@ -1,9 +1,9 @@
 // DNS auto-configuration for Linux.
 // Detection logic translated from tailscale #32ce1bdb48078ec4cedaeeb5b1b2ff9c0ef61a49
 
-use crate::defer;
 use anyhow::{Context, Result};
 use dbus::blocking::stdintf::org_freedesktop_dbus::Properties as _;
+use guarden::defer;
 use std::fs;
 use std::io::{self, BufRead, Cursor, Write};
 use std::net::Ipv4Addr;

@@ -2,7 +2,6 @@ use crate::{
     common::{config::EncryptionAlgorithm, log},
     tunnel::packet_def::ZCPacket,
 };
-use cfg_if::cfg_if;
 use std::sync::Arc;
 
 #[cfg(feature = "wireguard")]
@@ -61,7 +60,7 @@ impl Encryptor for NullCipher {
 pub fn create_encryptor(
     algorithm: &str,
     key_128: [u8; 16],
-    key_256: [u8; 32],
+    #[allow(unused_variables)] key_256: [u8; 32],
 ) -> Arc<dyn Encryptor> {
     let algorithm = match EncryptionAlgorithm::try_from(algorithm) {
         Ok(algorithm) => algorithm,
@@ -75,49 +74,33 @@ pub fn create_encryptor(
             default
         }
     };
+
     match algorithm {
         EncryptionAlgorithm::Xor => Arc::new(xor::XorCipher::new(&key_128)),
 
         #[cfg(any(feature = "aes-gcm", feature = "wireguard", feature = "openssl-crypto"))]
         EncryptionAlgorithm::AesGcm => {
-            cfg_if! {
-                if #[cfg(feature = "openssl-crypto")] {
-                    Arc::new(openssl::OpenSslCipher::new_aes128_gcm(key_128))
-                } else if #[cfg(feature = "wireguard")] {
-                    Arc::new(ring::RingCipher::new_aes128_gcm(key_128))
-                } else if #[cfg(feature = "aes-gcm")] {
-                    Arc::new(aes_gcm::AesGcmCipher::new_128(key_128))
-                } else {
-                    compile_error!("unreachable!");
-                }
+            cfg_select! {
+                feature = "openssl-crypto" => Arc::new(openssl::OpenSslCipher::new_aes128_gcm(key_128)),
+                feature = "wireguard" => Arc::new(ring::RingCipher::new_aes128_gcm(key_128)),
+                feature = "aes-gcm" => Arc::new(aes_gcm::AesGcmCipher::new_128(key_128)),
             }
         }
 
         #[cfg(any(feature = "aes-gcm", feature = "wireguard", feature = "openssl-crypto"))]
         EncryptionAlgorithm::Aes256Gcm => {
-            cfg_if! {
-                if #[cfg(feature = "openssl-crypto")] {
-                    Arc::new(openssl::OpenSslCipher::new_aes256_gcm(key_256))
-                } else if #[cfg(feature = "wireguard")] {
-                    Arc::new(ring::RingCipher::new_aes256_gcm(key_256))
-                } else if #[cfg(feature = "aes-gcm")] {
-                    Arc::new(aes_gcm::AesGcmCipher::new_256(key_256))
-                } else {
-                    compile_error!("unreachable!");
-                }
+            cfg_select! {
+                feature = "openssl-crypto" => Arc::new(openssl::OpenSslCipher::new_aes256_gcm(key_256)),
+                feature = "wireguard" => Arc::new(ring::RingCipher::new_aes256_gcm(key_256)),
+                feature = "aes-gcm" => Arc::new(aes_gcm::AesGcmCipher::new_256(key_256)),
             }
         }
 
         #[cfg(any(feature = "wireguard", feature = "openssl-crypto"))]
         EncryptionAlgorithm::ChaCha20 => {
-            cfg_if! {
-                if #[cfg(feature = "openssl-crypto")] {
-                    Arc::new(openssl::OpenSslCipher::new_chacha20(key_256))
-                } else if #[cfg(feature = "wireguard")] {
-                    Arc::new(ring::RingCipher::new_chacha20(key_256))
-                } else {
-                    compile_error!("unreachable!");
-                }
+            cfg_select! {
+                feature = "openssl-crypto" => Arc::new(openssl::OpenSslCipher::new_chacha20(key_256)),
+                feature = "wireguard" => Arc::new(ring::RingCipher::new_chacha20(key_256)),
             }
         }
     }

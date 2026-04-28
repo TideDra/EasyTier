@@ -1,11 +1,11 @@
+use crate::common::PeerId;
 use crate::common::acl_processor::PacketInfo;
 use crate::common::global_ctx::{ArcGlobalCtx, GlobalCtx};
-use crate::common::PeerId;
+use crate::gateway::CidrSet;
 use crate::gateway::tcp_proxy::{NatDstConnector, TcpProxy};
 use crate::gateway::wrapped_proxy::{ProxyAclHandler, TcpProxyForWrappedSrcTrait};
-use crate::gateway::CidrSet;
-use crate::peers::peer_manager::PeerManager;
 use crate::peers::PeerPacketFilter;
+use crate::peers::peer_manager::PeerManager;
 use crate::proto::acl::{ChainType, Protocol};
 use crate::proto::api::instance::{
     ListTcpProxyEntryRequest, ListTcpProxyEntryResponse, TcpProxyEntry, TcpProxyEntryState,
@@ -15,18 +15,21 @@ use crate::proto::peer_rpc::KcpConnData as QuicConnData;
 use crate::proto::rpc_types;
 use crate::proto::rpc_types::controller::BaseController;
 use crate::tunnel::packet_def::{
-    PacketType, PeerManagerHeader, ZCPacket, ZCPacketType, TAIL_RESERVED_SIZE,
+    PacketType, PeerManagerHeader, TAIL_RESERVED_SIZE, ZCPacket, ZCPacketType,
 };
 use crate::tunnel::quic::{client_config, endpoint_config, server_config};
-use anyhow::{anyhow, Context, Error};
+use anyhow::{Context, Error, anyhow};
 use atomic_refcell::AtomicRefCell;
 use bytes::{BufMut, Bytes, BytesMut};
 use dashmap::DashMap;
 use derivative::Derivative;
 use derive_more::{Constructor, Deref, DerefMut, From, Into};
+use guarden::defer;
 use prost::Message;
 use quinn::udp::{EcnCodepoint, RecvMeta, Transmit};
-use quinn::{AsyncUdpSocket, Endpoint, RecvStream, SendStream, StreamId, TokioRuntime, UdpPoller};
+use quinn::{
+    AsyncUdpSocket, Endpoint, RecvStream, SendStream, StreamId, UdpPoller, default_runtime,
+};
 use std::cmp::min;
 use std::future::Future;
 use std::io::IoSliceMut;
@@ -36,11 +39,11 @@ use std::ptr::copy_nonoverlapping;
 use std::sync::{Arc, Weak};
 use std::task::Poll;
 use std::time::Duration;
-use tokio::io::{join, AsyncReadExt, Join};
+use tokio::io::{AsyncReadExt, Join, join};
 use tokio::sync::mpsc::error::TrySendError;
-use tokio::sync::mpsc::{channel, Receiver, Sender};
+use tokio::sync::mpsc::{Receiver, Sender, channel};
 use tokio::task::JoinSet;
-use tokio::time::{timeout, Instant};
+use tokio::time::{Instant, timeout};
 use tokio::{join, pin, select};
 use tokio_util::sync::PollSender;
 use tracing::{debug, error, info, instrument, trace, warn};
@@ -174,9 +177,7 @@ impl AsyncUdpSocket for QuicSocket {
                     }
                     trace!(
                         "{:?} received {:?} bytes from {:?}",
-                        self.addr,
-                        len,
-                        packet.addr
+                        self.addr, len, packet.addr
                     );
                     buf[0..len].copy_from_slice(&packet.payload);
                     *meta = RecvMeta {
@@ -193,7 +194,7 @@ impl AsyncUdpSocket for QuicSocket {
                     return Poll::Ready(Err(std::io::Error::new(
                         std::io::ErrorKind::ConnectionAborted,
                         "socket closed",
-                    )))
+                    )));
                 }
                 Poll::Pending => break,
             }
@@ -611,6 +612,11 @@ impl QuicStreamReceiver {
                 }
 
                 _ = self.tasks.join_next(), if !self.tasks.is_empty() => {}
+
+                else => {
+                    info!("quic stream receiver endpoint closed, exiting");
+                    break;
+                }
             }
         }
     }
@@ -657,7 +663,7 @@ impl QuicStreamReceiver {
                 transport_type: TcpProxyEntryTransportType::Quic.into(),
             },
         );
-        crate::defer! {
+        defer! {
             proxy_entries.remove(&handle);
             if proxy_entries.capacity() - proxy_entries.len() > 16 {
                 proxy_entries.shrink_to_fit();
@@ -808,7 +814,7 @@ impl QuicProxy {
             endpoint_config(),
             Some(server_config()),
             Arc::new(socket),
-            Arc::new(TokioRuntime),
+            default_runtime().unwrap(),
         )
         .unwrap();
         endpoint.set_default_client_config(client_config());
@@ -965,12 +971,6 @@ mod tests {
     use super::*;
     use bytes::Buf;
 
-    fn init() {
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter("debug")
-            .try_init();
-    }
-
     /// Helper function: Create a pair of interconnected QuicSockets.
     /// Data sent by socket_a will enter socket_b's rx, and vice versa.
     fn make_socket_pair() -> (QuicSocket, QuicSocket) {
@@ -1022,7 +1022,7 @@ mod tests {
             endpoint_config.clone(),
             Some(server_config.clone()),
             socket_client.clone(),
-            Arc::new(TokioRuntime),
+            default_runtime().unwrap(),
         )
         .unwrap();
         client_endpoint.set_default_client_config(client_config.clone());
@@ -1032,7 +1032,7 @@ mod tests {
             endpoint_config.clone(),
             Some(server_config.clone()),
             socket_server.clone(),
-            Arc::new(TokioRuntime),
+            default_runtime().unwrap(),
         )
         .unwrap();
         server_endpoint.set_default_client_config(client_config.clone());
@@ -1250,7 +1250,7 @@ mod tests {
                                         // We agree that the first byte of data is (stream_index % 255)
                                         // This ensures stream data is not mixed
                                         let expected_byte = data[0] as usize; // Get the actual received marker
-                                                                              // Simple check of head and tail here, CRC can be used in production
+                                        // Simple check of head and tail here, CRC can be used in production
                                         if data[data.len() - 1] != data[0] {
                                             panic!("Stream data corruption");
                                         }

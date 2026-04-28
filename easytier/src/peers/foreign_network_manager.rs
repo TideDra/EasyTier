@@ -13,21 +13,21 @@ use std::{
 use dashmap::{DashMap, DashSet};
 use tokio::{
     sync::{
-        mpsc::{self, UnboundedReceiver, UnboundedSender},
         Mutex,
+        mpsc::{self, UnboundedReceiver, UnboundedSender},
     },
     task::JoinSet,
 };
 
 use crate::{
     common::{
+        PeerId,
         config::{ConfigLoader, TomlConfigLoader},
         error::Error,
         global_ctx::{ArcGlobalCtx, GlobalCtx, GlobalCtxEvent, NetworkIdentity, TrustedKeySource},
         join_joinset_background, shrink_dashmap,
         stats_manager::{LabelSet, LabelType, MetricName, StatsManager},
         token_bucket::TokenBucket,
-        PeerId,
     },
     peer_center::instance::{PeerCenterInstance, PeerMapWithPeerRpcManager},
     peers::route_trait::{Route, RouteInterface},
@@ -44,7 +44,7 @@ use crate::{
 };
 
 use super::{
-    create_packet_recv_chan,
+    PUBLIC_SERVER_HOSTNAME_PREFIX, PacketRecvChan, PacketRecvChanReceiver, create_packet_recv_chan,
     peer_conn::PeerConn,
     peer_map::PeerMap,
     peer_ospf_route::PeerRoute,
@@ -55,10 +55,9 @@ use super::{
     relay_peer_map::RelayPeerMap,
     route_trait::NextHopPolicy,
     traffic_metrics::{
-        route_peer_info_instance_id, InstanceLabelKind, LogicalTrafficMetrics,
-        TrafficMetricRecorder,
+        InstanceLabelKind, LogicalTrafficMetrics, TrafficKind, TrafficMetricRecorder,
+        route_peer_info_instance_id, traffic_kind,
     },
-    PacketRecvChan, PacketRecvChanReceiver, PUBLIC_SERVER_HOSTNAME_PREFIX,
 };
 
 #[async_trait::async_trait]
@@ -420,12 +419,19 @@ impl ForeignNetworkEntry {
 
         let label_set =
             LabelSet::new().with_label_type(LabelType::NetworkName(network_name.clone()));
-        let forward_bytes = self
+        let forward_data_bytes = self
             .stats_mgr
             .get_counter(MetricName::TrafficBytesForwarded, label_set.clone());
-        let forward_packets = self
+        let forward_data_packets = self
             .stats_mgr
             .get_counter(MetricName::TrafficPacketsForwarded, label_set.clone());
+        let forward_control_bytes = self
+            .stats_mgr
+            .get_counter(MetricName::TrafficControlBytesForwarded, label_set.clone());
+        let forward_control_packets = self.stats_mgr.get_counter(
+            MetricName::TrafficControlPacketsForwarded,
+            label_set.clone(),
+        );
         let rx_bytes = self
             .stats_mgr
             .get_counter(MetricName::TrafficBytesSelfRx, label_set.clone());
@@ -503,8 +509,16 @@ impl ForeignNetworkEntry {
                         }
                     }
 
-                    forward_bytes.add(buf_len as u64);
-                    forward_packets.inc();
+                    match traffic_kind(packet_type) {
+                        TrafficKind::Data => {
+                            forward_data_bytes.add(buf_len as u64);
+                            forward_data_packets.inc();
+                        }
+                        TrafficKind::Control => {
+                            forward_control_bytes.add(buf_len as u64);
+                            forward_control_packets.inc();
+                        }
+                    }
 
                     let gateway_peer_id = peer_map
                         .get_gateway_peer_id(to_peer_id, NextHopPolicy::LeastHop)
@@ -730,16 +744,44 @@ impl ForeignNetworkManager {
         matches!(identity_type, PeerIdentityType::Admin)
     }
 
-    async fn is_credential_pubkey_trusted(
-        entry: &ForeignNetworkEntry,
+    fn credential_pubkey_is_trusted(
+        global_ctx: &ArcGlobalCtx,
+        network_name: &str,
         remote_static_pubkey: &[u8],
     ) -> bool {
         remote_static_pubkey.len() == 32
-            && entry.global_ctx.is_pubkey_trusted_with_source(
+            && global_ctx.is_pubkey_trusted_with_source(
                 remote_static_pubkey,
-                &entry.network.network_name,
+                network_name,
                 TrustedKeySource::OspfCredential,
             )
+    }
+
+    fn is_credential_pubkey_trusted(
+        entry: &ForeignNetworkEntry,
+        remote_static_pubkey: &[u8],
+    ) -> bool {
+        Self::credential_pubkey_is_trusted(
+            &entry.global_ctx,
+            &entry.network.network_name,
+            remote_static_pubkey,
+        )
+    }
+
+    pub(crate) fn is_existing_credential_pubkey_trusted(
+        &self,
+        network_name: &str,
+        remote_static_pubkey: &[u8],
+    ) -> bool {
+        self.data
+            .get_network_entry(network_name)
+            .is_some_and(|entry| {
+                Self::credential_pubkey_is_trusted(
+                    &entry.global_ctx,
+                    &entry.network.network_name,
+                    remote_static_pubkey,
+                )
+            })
     }
 
     fn build_trusted_key_items(entry: &ForeignNetworkEntry) -> Vec<TrustedKeyInfoPb> {
@@ -839,8 +881,7 @@ impl ForeignNetworkManager {
         let same_identity = entry.network == peer_network;
         let peer_identity_type = peer_conn.get_peer_identity_type();
         let credential_peer_trusted = peer_digest_empty
-            && Self::is_credential_pubkey_trusted(&entry, &conn_info.noise_remote_static_pubkey)
-                .await;
+            && Self::is_credential_pubkey_trusted(&entry, &conn_info.noise_remote_static_pubkey);
         let credential_identity_mismatch = credential_peer_trusted
             && Self::should_reject_credential_trust_path(peer_identity_type);
 
@@ -1267,6 +1308,11 @@ pub mod tests {
             MetricName::TrafficBytesForwarded,
             network_labels.clone(),
         );
+        let forwarded_packets_before = metric_value(
+            &pm_center,
+            MetricName::TrafficPacketsForwarded,
+            network_labels.clone(),
+        );
         let rx_bytes_before = metric_value(
             &pm_center,
             MetricName::TrafficBytesRx,
@@ -1294,6 +1340,7 @@ pub mod tests {
             pmb_net1.my_peer_id(),
             PacketType::Data as u8,
         );
+        let transit_pkt_len = transit_pkt.buf_len() as u64;
         pma_net1
             .get_foreign_network_client()
             .send_msg(transit_pkt, center_peer_id)
@@ -1308,7 +1355,12 @@ pub mod tests {
                         &pm_center,
                         MetricName::TrafficBytesForwarded,
                         network_labels.clone(),
-                    ) > forwarded_bytes_before
+                    ) >= forwarded_bytes_before + transit_pkt_len
+                        && metric_value(
+                            &pm_center,
+                            MetricName::TrafficPacketsForwarded,
+                            network_labels.clone(),
+                        ) > forwarded_packets_before
                 }
             },
             Duration::from_secs(5),
@@ -1343,6 +1395,70 @@ pub mod tests {
             metric_value(&pm_center, MetricName::TrafficPacketsTx, network_labels),
             tx_packets_before
         );
+    }
+
+    #[tokio::test]
+    async fn foreign_network_transit_control_forwarding_records_control_forwarded_metrics() {
+        let pm_center = create_mock_peer_manager_with_mock_stun(NatType::Unknown).await;
+        let pma_net1 = create_mock_peer_manager_for_foreign_network("net1").await;
+        let pmb_net1 = create_mock_peer_manager_for_foreign_network("net1").await;
+
+        connect_peer_manager(pma_net1.clone(), pm_center.clone()).await;
+        connect_peer_manager(pmb_net1.clone(), pm_center.clone()).await;
+        wait_route_appear(pma_net1.clone(), pmb_net1.clone())
+            .await
+            .unwrap();
+
+        let center_peer_id = pm_center
+            .get_foreign_network_manager()
+            .get_network_peer_id("net1")
+            .unwrap();
+        let network_labels =
+            LabelSet::new().with_label_type(LabelType::NetworkName("net1".to_string()));
+        let forwarded_bytes_before = metric_value(
+            &pm_center,
+            MetricName::TrafficControlBytesForwarded,
+            network_labels.clone(),
+        );
+        let forwarded_packets_before = metric_value(
+            &pm_center,
+            MetricName::TrafficControlPacketsForwarded,
+            network_labels.clone(),
+        );
+
+        let mut transit_pkt = ZCPacket::new_with_payload(b"foreign-control-transit");
+        transit_pkt.fill_peer_manager_hdr(
+            pma_net1.my_peer_id(),
+            pmb_net1.my_peer_id(),
+            PacketType::RpcReq as u8,
+        );
+        let transit_pkt_len = transit_pkt.buf_len() as u64;
+        pma_net1
+            .get_foreign_network_client()
+            .send_msg(transit_pkt, center_peer_id)
+            .await
+            .unwrap();
+
+        wait_for_condition(
+            || {
+                let pm_center = pm_center.clone();
+                let network_labels = network_labels.clone();
+                async move {
+                    metric_value(
+                        &pm_center,
+                        MetricName::TrafficControlBytesForwarded,
+                        network_labels.clone(),
+                    ) >= forwarded_bytes_before + transit_pkt_len
+                        && metric_value(
+                            &pm_center,
+                            MetricName::TrafficControlPacketsForwarded,
+                            network_labels.clone(),
+                        ) > forwarded_packets_before
+                }
+            },
+            Duration::from_secs(5),
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -1427,9 +1543,11 @@ pub mod tests {
             .get_foreign_network_manager()
             .list_foreign_networks()
             .await;
-        assert!(without_trusted_keys.foreign_networks["net1"]
-            .trusted_keys
-            .is_empty());
+        assert!(
+            without_trusted_keys.foreign_networks["net1"]
+                .trusted_keys
+                .is_empty()
+        );
 
         let foreign_mgr = pm_center.get_foreign_network_manager();
         wait_for_condition(
@@ -1450,9 +1568,46 @@ pub mod tests {
         .await;
 
         let with_trusted_keys = foreign_mgr.list_foreign_networks_with_options(true).await;
-        assert!(!with_trusted_keys.foreign_networks["net1"]
-            .trusted_keys
-            .is_empty());
+        assert!(
+            !with_trusted_keys.foreign_networks["net1"]
+                .trusted_keys
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn secure_center_can_serve_legacy_and_secure_foreign_networks() {
+        let pm_center = create_mock_peer_manager_with_mock_stun(NatType::Unknown).await;
+        set_secure_mode_cfg(&pm_center.get_global_ctx(), true);
+
+        let legacy_a = create_mock_peer_manager_for_foreign_network("legacy-net").await;
+        let legacy_b = create_mock_peer_manager_for_foreign_network("legacy-net").await;
+        connect_peer_manager(legacy_a.clone(), pm_center.clone()).await;
+        connect_peer_manager(legacy_b.clone(), pm_center.clone()).await;
+        wait_route_appear(legacy_a.clone(), legacy_b.clone())
+            .await
+            .unwrap();
+
+        let secure_a = create_mock_peer_manager_for_secure_foreign_network("secure-net").await;
+        let secure_b = create_mock_peer_manager_for_secure_foreign_network("secure-net").await;
+        connect_peer_manager(secure_a.clone(), pm_center.clone()).await;
+        connect_peer_manager(secure_b.clone(), pm_center.clone()).await;
+        wait_route_appear(secure_a.clone(), secure_b.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(2, legacy_a.list_routes().await.len());
+        assert_eq!(2, legacy_b.list_routes().await.len());
+        assert_eq!(2, secure_a.list_routes().await.len());
+        assert_eq!(2, secure_b.list_routes().await.len());
+
+        let rpc_resp = pm_center
+            .get_foreign_network_manager()
+            .list_foreign_networks()
+            .await;
+        assert_eq!(2, rpc_resp.foreign_networks.len());
+        assert_eq!(2, rpc_resp.foreign_networks["legacy-net"].peers.len());
+        assert_eq!(2, rpc_resp.foreign_networks["secure-net"].peers.len());
     }
 
     #[tokio::test]
@@ -1483,7 +1638,9 @@ pub mod tests {
             )]),
             &foreign_network.network_name,
         );
-        assert!(!ForeignNetworkManager::is_credential_pubkey_trusted(&entry, &pubkey).await);
+        assert!(!ForeignNetworkManager::is_credential_pubkey_trusted(
+            &entry, &pubkey
+        ));
 
         entry.global_ctx.update_trusted_keys(
             HashMap::from([(
@@ -1495,7 +1652,9 @@ pub mod tests {
             )]),
             &foreign_network.network_name,
         );
-        assert!(ForeignNetworkManager::is_credential_pubkey_trusted(&entry, &pubkey).await);
+        assert!(ForeignNetworkManager::is_credential_pubkey_trusted(
+            &entry, &pubkey
+        ));
     }
 
     #[test]
@@ -1527,12 +1686,14 @@ pub mod tests {
 
         assert!(client.await.unwrap().is_ok());
         assert!(server.await.unwrap().is_err());
-        assert!(pm_center
-            .get_foreign_network_manager()
-            .list_foreign_networks()
-            .await
-            .foreign_networks
-            .is_empty());
+        assert!(
+            pm_center
+                .get_foreign_network_manager()
+                .list_foreign_networks()
+                .await
+                .foreign_networks
+                .is_empty()
+        );
     }
 
     async fn foreign_network_whitelist_helper(name: String) {
@@ -1620,20 +1781,24 @@ pub mod tests {
             .unwrap();
 
         assert_eq!(
-            vec![pm_center
-                .get_foreign_network_manager()
-                .get_network_peer_id("net1")
-                .unwrap()],
+            vec![
+                pm_center
+                    .get_foreign_network_manager()
+                    .get_network_peer_id("net1")
+                    .unwrap()
+            ],
             pma_net1
                 .get_foreign_network_client()
                 .get_peer_map()
                 .list_peers()
         );
         assert_eq!(
-            vec![pm_center
-                .get_foreign_network_manager()
-                .get_network_peer_id("net1")
-                .unwrap()],
+            vec![
+                pm_center
+                    .get_foreign_network_manager()
+                    .get_network_peer_id("net1")
+                    .unwrap()
+            ],
             pmb_net1
                 .get_foreign_network_client()
                 .get_peer_map()

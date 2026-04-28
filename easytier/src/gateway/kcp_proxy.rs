@@ -7,6 +7,7 @@ use std::{
 use anyhow::Context;
 use bytes::Bytes;
 use dashmap::DashMap;
+use guarden::defer;
 use kcp_sys::{
     endpoint::{ConnId, KcpEndpoint, KcpPacketReceiver},
     ffi_safe::KcpConfig,
@@ -17,8 +18,8 @@ use prost::Message;
 use tokio::{select, task::JoinSet};
 
 use super::{
-    tcp_proxy::{NatDstConnector, NatDstTcpConnector, TcpProxy},
     CidrSet,
+    tcp_proxy::{NatDstConnector, NatDstTcpConnector, TcpProxy},
 };
 use crate::{
     common::{
@@ -27,7 +28,7 @@ use crate::{
         global_ctx::{ArcGlobalCtx, GlobalCtx},
     },
     gateway::wrapped_proxy::{ProxyAclHandler, TcpProxyForWrappedSrcTrait},
-    peers::{peer_manager::PeerManager, PeerPacketFilter},
+    peers::{PeerPacketFilter, peer_manager::PeerManager},
     proto::{
         acl::{ChainType, Protocol},
         api::instance::{
@@ -359,7 +360,7 @@ impl KcpProxyDst {
                 transport_type: TcpProxyEntryTransportType::Kcp.into(),
             },
         );
-        crate::defer! {
+        defer! {
             proxy_entries.remove(&conn_id);
             if proxy_entries.capacity() - proxy_entries.len() > 16 {
                 proxy_entries.shrink_to_fit();

@@ -5,8 +5,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::time::interval;
-
-use crate::common::scoped_task::ScopedTask;
+use tokio_util::task::AbortOnDropHandle;
 
 /// Predefined metric names for type safety
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -42,6 +41,8 @@ pub enum MetricName {
     TrafficControlBytesRxByInstance,
     /// Traffic bytes forwarded
     TrafficBytesForwarded,
+    /// Control-plane traffic bytes forwarded
+    TrafficControlBytesForwarded,
     /// Traffic bytes sent to self
     TrafficBytesSelfTx,
     /// Traffic bytes received from self
@@ -71,6 +72,8 @@ pub enum MetricName {
     TrafficControlPacketsRxByInstance,
     /// Traffic packets forwarded
     TrafficPacketsForwarded,
+    /// Control-plane traffic packets forwarded
+    TrafficControlPacketsForwarded,
     /// Traffic packets sent to self
     TrafficPacketsSelfTx,
     /// Traffic packets received from self
@@ -117,6 +120,9 @@ impl fmt::Display for MetricName {
                 write!(f, "traffic_control_bytes_rx_by_instance")
             }
             MetricName::TrafficBytesForwarded => write!(f, "traffic_bytes_forwarded"),
+            MetricName::TrafficControlBytesForwarded => {
+                write!(f, "traffic_control_bytes_forwarded")
+            }
             MetricName::TrafficBytesSelfTx => write!(f, "traffic_bytes_self_tx"),
             MetricName::TrafficBytesSelfRx => write!(f, "traffic_bytes_self_rx"),
             MetricName::TrafficBytesForeignForwardRx => {
@@ -146,6 +152,9 @@ impl fmt::Display for MetricName {
                 write!(f, "traffic_control_packets_rx_by_instance")
             }
             MetricName::TrafficPacketsForwarded => write!(f, "traffic_packets_forwarded"),
+            MetricName::TrafficControlPacketsForwarded => {
+                write!(f, "traffic_control_packets_forwarded")
+            }
             MetricName::TrafficPacketsSelfTx => write!(f, "traffic_packets_self_tx"),
             MetricName::TrafficPacketsSelfRx => write!(f, "traffic_packets_self_rx"),
             MetricName::TrafficPacketsForeignForwardRx => {
@@ -374,7 +383,9 @@ impl UnsafeCounter {
     /// that no other thread is accessing this counter simultaneously.
     pub unsafe fn add(&self, delta: u64) {
         let ptr = self.value.get();
-        *ptr = (*ptr).saturating_add(delta);
+        unsafe {
+            *ptr = (*ptr).saturating_add(delta);
+        }
     }
 
     /// Increment the counter by 1
@@ -382,7 +393,9 @@ impl UnsafeCounter {
     /// This method is unsafe because it uses UnsafeCell. The caller must ensure
     /// that no other thread is accessing this counter simultaneously.
     pub unsafe fn inc(&self) {
-        self.add(1);
+        unsafe {
+            self.add(1);
+        }
     }
 
     /// Get the current value of the counter
@@ -391,7 +404,7 @@ impl UnsafeCounter {
     /// that no other thread is modifying this counter simultaneously.
     pub unsafe fn get(&self) -> u64 {
         let ptr = self.value.get();
-        *ptr
+        unsafe { *ptr }
     }
 
     /// Reset the counter to zero
@@ -400,7 +413,9 @@ impl UnsafeCounter {
     /// that no other thread is accessing this counter simultaneously.
     pub unsafe fn reset(&self) {
         let ptr = self.value.get();
-        *ptr = 0;
+        unsafe {
+            *ptr = 0;
+        }
     }
 
     /// Set the counter to a specific value
@@ -409,7 +424,9 @@ impl UnsafeCounter {
     /// that no other thread is accessing this counter simultaneously.
     pub unsafe fn set(&self, value: u64) {
         let ptr = self.value.get();
-        *ptr = value;
+        unsafe {
+            *ptr = value;
+        }
     }
 }
 
@@ -446,7 +463,9 @@ impl MetricData {
     /// that no other thread is accessing this timestamp simultaneously.
     unsafe fn touch(&self) {
         let ptr = self.last_updated.get();
-        *ptr = Instant::now();
+        unsafe {
+            *ptr = Instant::now();
+        }
     }
 
     /// Get the last updated timestamp
@@ -455,7 +474,7 @@ impl MetricData {
     /// that no other thread is modifying this timestamp simultaneously.
     unsafe fn get_last_updated(&self) -> Instant {
         let ptr = self.last_updated.get();
-        *ptr
+        unsafe { *ptr }
     }
 }
 
@@ -558,7 +577,7 @@ impl MetricSnapshot {
 /// StatsManager manages global statistics with high performance counters
 pub struct StatsManager {
     counters: Arc<DashMap<MetricKey, Arc<MetricData>>>,
-    cleanup_task: ScopedTask<()>,
+    cleanup_task: AbortOnDropHandle<()>,
 }
 
 impl StatsManager {
@@ -581,9 +600,9 @@ impl StatsManager {
                     break;
                 };
 
-                // Remove entries that haven't been updated for 3 minutes
-                counters.retain(|_, metric_data: &mut Arc<MetricData>| unsafe {
-                    metric_data.get_last_updated() > cutoff_time
+                counters.retain(|_, metric_data: &mut Arc<MetricData>| {
+                    Arc::strong_count(metric_data) > 1
+                        || unsafe { metric_data.get_last_updated() > cutoff_time }
                 });
                 counters.shrink_to_fit();
             }
@@ -591,7 +610,7 @@ impl StatsManager {
 
         Self {
             counters,
-            cleanup_task: cleanup_task.into(),
+            cleanup_task: AbortOnDropHandle::new(cleanup_task),
         }
     }
 
@@ -898,6 +917,33 @@ mod tests {
 
         counter2.add(5);
         assert_eq!(counter2.get(), 25);
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_keeps_metrics_with_live_handles() {
+        let stats = StatsManager::new();
+        let counter = stats.get_simple_counter(MetricName::TrafficBytesForwarded);
+        counter.set(1);
+
+        let cutoff_time = Instant::now().checked_add(Duration::from_secs(1)).unwrap();
+        stats
+            .counters
+            .retain(|_, metric_data: &mut Arc<MetricData>| {
+                Arc::strong_count(metric_data) > 1
+                    || unsafe { metric_data.get_last_updated() > cutoff_time }
+            });
+
+        assert_eq!(stats.metric_count(), 1);
+        assert_eq!(stats.get_all_metrics().len(), 1);
+
+        drop(counter);
+        stats
+            .counters
+            .retain(|_, metric_data: &mut Arc<MetricData>| {
+                Arc::strong_count(metric_data) > 1
+                    || unsafe { metric_data.get_last_updated() > cutoff_time }
+            });
+        assert_eq!(stats.metric_count(), 0);
     }
 
     #[tokio::test]

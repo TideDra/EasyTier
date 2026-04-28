@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use anyhow::Context;
 use hickory_proto::runtime::TokioRuntimeProvider;
@@ -121,9 +121,8 @@ pub async fn socket_addrs(
 
 #[cfg(test)]
 mod tests {
-    use crate::defer;
-
     use super::*;
+    use guarden::defer;
 
     #[tokio::test]
     async fn test_socket_addrs() {
