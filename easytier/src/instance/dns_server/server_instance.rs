@@ -9,7 +9,7 @@
 use super::{
     MAGIC_DNS_INSTANCE_SOCKET_ADDR,
     config::{GeneralConfigBuilder, RunConfigBuilder},
-    records::{build_authorities, default_soa},
+    records::{AUTO_RECORD_TTL_SECS, build_authorities, default_soa},
     server::Server,
     system_config::{OSConfig, SystemConfig},
     zone,
@@ -328,7 +328,7 @@ impl MagicDnsServerRpc for MagicDnsServerInstanceData {
                     record: Some(dns_record::Record::A(DnsRecordA {
                         name: format!("{}.{}", route.hostname, zone),
                         value: route.ipv4_addr.map(Into::into),
-                        ttl: 1,
+                        ttl: AUTO_RECORD_TTL_SECS as i32,
                     })),
                 });
             }
@@ -555,6 +555,16 @@ fn get_system_config(
     Ok(None)
 }
 
+fn default_excluded_forward_nameservers(fake_ip: Ipv4Addr) -> Vec<std::net::IpAddr> {
+    vec![
+        fake_ip.into(),
+        // Exclude systemd-resolved stub addresses so non-authoritative queries
+        // sent to Magic DNS are never forwarded back into the local stub loop.
+        Ipv4Addr::new(127, 0, 0, 53).into(),
+        Ipv4Addr::new(127, 0, 0, 54).into(),
+    ]
+}
+
 impl MagicDnsServerInstance {
     async fn add_fake_ip_route(
         tun_dev_name: &str,
@@ -670,7 +680,7 @@ impl MagicDnsServerInstance {
         };
         let dns_config = RunConfigBuilder::default()
             .general(GeneralConfigBuilder::default().build()?)
-            .excluded_forward_nameservers(vec![fake_ip.into()])
+            .excluded_forward_nameservers(default_excluded_forward_nameservers(fake_ip))
             .build()?;
         let mut dns_server = Server::new(dns_config);
         dns_server.run().await?;
@@ -2440,7 +2450,7 @@ mod tests {
                 ["10.0.0.8", "10.0.0.10"].map(|ip| ip.parse::<Ipv4Addr>().unwrap())
             );
             for answer in query(&data, "node.et.net.", RecordType::A).await.answers() {
-                assert_eq!(answer.ttl(), 1);
+                assert_eq!(answer.ttl(), AUTO_RECORD_TTL_SECS);
             }
             data.on_client_disconnected(controller(54001).get_tunnel_info().cloned())
                 .await;
@@ -2991,6 +3001,19 @@ mod tests {
         assert_eq!(
             a(&data, "svc.accepted.test.").await,
             vec![Ipv4Addr::new(10, 0, 0, 2)]
+        );
+    }
+
+    #[test]
+    fn default_excluded_forward_nameservers_includes_fake_ip_and_resolved_stubs() {
+        let fake_ip = Ipv4Addr::new(100, 100, 100, 101);
+        assert_eq!(
+            default_excluded_forward_nameservers(fake_ip),
+            vec![
+                std::net::IpAddr::V4(fake_ip),
+                std::net::IpAddr::V4(Ipv4Addr::new(127, 0, 0, 53)),
+                std::net::IpAddr::V4(Ipv4Addr::new(127, 0, 0, 54)),
+            ]
         );
     }
 }

@@ -10,6 +10,8 @@ use hickory_server::{authority::ZoneType, store::in_memory::InMemoryAuthority};
 
 use super::config::{RecordBuilder, RecordType as ConfigRecordType};
 
+pub(super) const AUTO_RECORD_TTL_SECS: u32 = 15;
+
 pub(super) fn default_soa(origin: &LowerName) -> anyhow::Result<Record> {
     let soa = SOA::new(
         origin.prepend_label("ns")?,
@@ -98,7 +100,7 @@ pub(super) fn build_authorities(
                 .rr_type(ConfigRecordType::A)
                 .name(format!("{}.{}", route.hostname, origin))
                 .value(address.to_string())
-                .ttl(Duration::from_secs(1))
+                .ttl(Duration::from_secs(u64::from(AUTO_RECORD_TTL_SECS)))
                 .build()?;
             let mut record: Record = match (&record).try_into() {
                 Ok(record) => record,

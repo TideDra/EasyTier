@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use futures::future::BoxFuture;
 use smoltcp::wire::{
     IPV4_HEADER_LEN, Icmpv4Message, Icmpv4Packet, IpAddress, IpProtocol, Ipv4Packet,
-    UDP_HEADER_LEN, UdpPacket,
+    TCP_HEADER_LEN, TcpPacket, TcpSeqNumber, UDP_HEADER_LEN, UdpPacket,
 };
 
 use crate::{
@@ -185,11 +185,25 @@ impl NicPacketFilter for MagicDnsPacketFilter {
 }
 
 #[derive(Clone, Copy)]
+enum MagicDnsPacketAction {
+    UdpQuery {
+        source_port: u16,
+        destination_port: u16,
+    },
+    IcmpEcho,
+    TcpRst {
+        source_port: u16,
+        destination_port: u16,
+        ack_number: TcpSeqNumber,
+    },
+}
+
+#[derive(Clone, Copy)]
 struct MagicDnsPacketInfo {
     source_ip: Ipv4Addr,
     destination_ip: Ipv4Addr,
     ip_header_length: usize,
-    udp_ports: Option<(u16, u16)>,
+    action: MagicDnsPacketAction,
 }
 
 impl MagicDnsPacketInfo {
@@ -211,7 +225,7 @@ impl MagicDnsPacketInfo {
             return None;
         }
         let payload = &packet.payload()[header_length..];
-        let udp_ports = match ip.next_header() {
+        let action = match ip.next_header() {
             IpProtocol::Udp => {
                 if payload.len() < UDP_HEADER_LEN {
                     return None;
@@ -220,14 +234,35 @@ impl MagicDnsPacketInfo {
                 if udp.len() as usize != payload.len() || udp.dst_port() != 53 {
                     return None;
                 }
-                Some((udp.src_port(), udp.dst_port()))
+                MagicDnsPacketAction::UdpQuery {
+                    source_port: udp.src_port(),
+                    destination_port: udp.dst_port(),
+                }
             }
             IpProtocol::Icmp => {
                 let icmp = Icmpv4Packet::new_checked(payload).ok()?;
                 if icmp.msg_type() != Icmpv4Message::EchoRequest {
                     return None;
                 }
-                None
+                MagicDnsPacketAction::IcmpEcho
+            }
+            IpProtocol::Tcp => {
+                let tcp = TcpPacket::new_checked(payload).ok()?;
+                if (tcp.header_len() as usize) < TCP_HEADER_LEN
+                    || tcp.dst_port() != 53
+                    || !tcp.syn()
+                    || tcp.ack()
+                    || tcp.rst()
+                    || tcp.fin()
+                {
+                    return None;
+                }
+                let seg_len = (tcp.payload().len() as i32).wrapping_add(1);
+                MagicDnsPacketAction::TcpRst {
+                    source_port: tcp.src_port(),
+                    destination_port: tcp.dst_port(),
+                    ack_number: TcpSeqNumber(tcp.seq_number().0.wrapping_add(seg_len)),
+                }
             }
             _ => return None,
         };
@@ -235,12 +270,14 @@ impl MagicDnsPacketInfo {
             source_ip: ip.src_addr(),
             destination_ip: ip.dst_addr(),
             ip_header_length: header_length,
-            udp_ports,
+            action,
         })
     }
 
     fn query(&self, packet: &ZCPacket) -> Option<MagicDnsQuery> {
-        let (source_port, _) = self.udp_ports?;
+        let MagicDnsPacketAction::UdpQuery { source_port, .. } = self.action else {
+            return None;
+        };
         Some(MagicDnsQuery {
             source: (self.source_ip, source_port).into(),
             payload: packet.payload()[self.ip_header_length + UDP_HEADER_LEN..].to_vec(),
@@ -253,26 +290,49 @@ impl MagicDnsPacketInfo {
         my_peer_id: PeerId,
         response: Option<&[u8]>,
     ) -> bool {
-        if let Some((source_port, destination_port)) = self.udp_ports {
-            let Some(response) = response else {
-                return false;
-            };
-            if !apply_udp_response(
-                packet,
-                self.source_ip,
-                self.destination_ip,
+        match self.action {
+            MagicDnsPacketAction::UdpQuery {
                 source_port,
                 destination_port,
-                self.ip_header_length,
-                response,
-            ) {
-                return false;
+            } => {
+                let Some(response) = response else {
+                    return false;
+                };
+                if !apply_udp_response(
+                    packet,
+                    self.source_ip,
+                    self.destination_ip,
+                    source_port,
+                    destination_port,
+                    self.ip_header_length,
+                    response,
+                ) {
+                    return false;
+                }
             }
-        } else {
-            let mut icmp =
-                Icmpv4Packet::new_unchecked(&mut packet.mut_payload()[self.ip_header_length..]);
-            icmp.set_msg_type(Icmpv4Message::EchoReply);
-            icmp.fill_checksum();
+            MagicDnsPacketAction::IcmpEcho => {
+                let mut icmp =
+                    Icmpv4Packet::new_unchecked(&mut packet.mut_payload()[self.ip_header_length..]);
+                icmp.set_msg_type(Icmpv4Message::EchoReply);
+                icmp.fill_checksum();
+            }
+            MagicDnsPacketAction::TcpRst {
+                source_port,
+                destination_port,
+                ack_number,
+            } => {
+                if !apply_tcp_rst(
+                    packet,
+                    self.source_ip,
+                    self.destination_ip,
+                    source_port,
+                    destination_port,
+                    ack_number,
+                    self.ip_header_length,
+                ) {
+                    return false;
+                }
+            }
         }
         let mut ip = Ipv4Packet::new_unchecked(packet.mut_payload());
         ip.set_src_addr(self.destination_ip);
@@ -284,6 +344,57 @@ impl MagicDnsPacketInfo {
         header.len.set(payload_length);
         true
     }
+}
+
+/// Reply to TCP SYN on port 53 with RST|ACK so resolvers like systemd-resolved
+/// immediately see that TCP DNS is unsupported instead of waiting for timeout.
+fn apply_tcp_rst(
+    packet: &mut ZCPacket,
+    source_ip: Ipv4Addr,
+    destination_ip: Ipv4Addr,
+    source_port: u16,
+    destination_port: u16,
+    ack_number: TcpSeqNumber,
+    ip_header_length: usize,
+) -> bool {
+    let Some(ip_length) = ip_header_length.checked_add(TCP_HEADER_LEN) else {
+        return false;
+    };
+    if ip_length > u16::MAX as usize {
+        return false;
+    };
+    let Some(header_length) = packet.buf_len().checked_sub(packet.payload().len()) else {
+        return false;
+    };
+    let Some(inner_length) = header_length.checked_add(ip_length) else {
+        return false;
+    };
+
+    if packet.mut_inner().capacity() < inner_length {
+        packet
+            .mut_inner()
+            .truncate(header_length + ip_header_length);
+    }
+    packet.mut_inner().resize(inner_length, 0);
+
+    let mut ip_packet = Ipv4Packet::new_unchecked(packet.mut_payload());
+    ip_packet.set_total_len(ip_length as u16);
+    let tcp_bytes = ip_packet.payload_mut();
+    tcp_bytes.fill(0);
+    let mut tcp_packet = TcpPacket::new_unchecked(tcp_bytes);
+    tcp_packet.set_src_port(destination_port);
+    tcp_packet.set_dst_port(source_port);
+    tcp_packet.set_seq_number(TcpSeqNumber(0));
+    tcp_packet.set_ack_number(ack_number);
+    tcp_packet.set_header_len(TCP_HEADER_LEN as u8);
+    tcp_packet.set_rst(true);
+    tcp_packet.set_ack(true);
+    tcp_packet.set_window_len(0);
+    tcp_packet.fill_checksum(
+        &IpAddress::Ipv4(destination_ip),
+        &IpAddress::Ipv4(source_ip),
+    );
+    true
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -715,5 +826,75 @@ mod tests {
     fn packet_engine_ignores_non_dns_udp() {
         let packet = udp_query(b"query", 5353);
         assert!(MagicDnsPacketInfo::parse(&packet, "100.100.100.101".parse().unwrap()).is_none());
+    }
+
+    fn tcp_syn(destination_port: u16, seq: i32, ack: bool) -> ZCPacket {
+        // Include 4 bytes of TCP options (header_len = 24) to verify truncation to 20 bytes.
+        let mut bytes = vec![0; 20 + 24];
+        {
+            let mut ip = Ipv4Packet::new_unchecked(&mut bytes);
+            ip.set_version(4);
+            ip.set_header_len(20);
+            ip.set_total_len(44);
+            ip.set_next_header(IpProtocol::Tcp);
+            ip.set_src_addr("10.0.0.2".parse().unwrap());
+            ip.set_dst_addr("100.100.100.101".parse().unwrap());
+            let mut tcp = TcpPacket::new_unchecked(ip.payload_mut());
+            tcp.set_src_port(53001);
+            tcp.set_dst_port(destination_port);
+            tcp.set_seq_number(TcpSeqNumber(seq));
+            tcp.set_header_len(24);
+            tcp.set_syn(true);
+            tcp.set_ack(ack);
+            tcp.set_window_len(64240);
+            tcp.fill_checksum(
+                &IpAddress::Ipv4("10.0.0.2".parse().unwrap()),
+                &IpAddress::Ipv4("100.100.100.101".parse().unwrap()),
+            );
+        }
+        ZCPacket::new_with_payload(&bytes)
+    }
+
+    #[test]
+    fn packet_engine_replies_tcp_rst_ack_to_dns_syn_without_calling_dns() {
+        let mut packet = tcp_syn(53, 1000, false);
+        let info = MagicDnsPacketInfo::parse(&packet, "100.100.100.101".parse().unwrap()).unwrap();
+        assert!(info.query(&packet).is_none());
+
+        assert!(info.apply_response(&mut packet, 9, None));
+        let ip = Ipv4Packet::new_checked(packet.payload()).unwrap();
+        assert!(ip.verify_checksum());
+        assert_eq!(ip.total_len(), 40);
+        assert_eq!(
+            ip.src_addr(),
+            "100.100.100.101".parse::<Ipv4Addr>().unwrap()
+        );
+        assert_eq!(ip.dst_addr(), "10.0.0.2".parse::<Ipv4Addr>().unwrap());
+
+        let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+        assert!(tcp.verify_checksum(
+            &IpAddress::Ipv4(ip.src_addr()),
+            &IpAddress::Ipv4(ip.dst_addr()),
+        ));
+        assert_eq!(tcp.header_len(), 20);
+        assert_eq!(tcp.src_port(), 53);
+        assert_eq!(tcp.dst_port(), 53001);
+        assert_eq!(tcp.seq_number(), TcpSeqNumber(0));
+        assert_eq!(tcp.ack_number(), TcpSeqNumber(1001));
+        assert!(tcp.rst());
+        assert!(tcp.ack());
+        assert!(!tcp.syn());
+        assert_eq!(packet.get_dst_peer_id(), Some(9));
+        assert_eq!(
+            packet.peer_manager_header().unwrap().len.get() as usize,
+            packet.payload().len()
+        );
+    }
+
+    #[test]
+    fn packet_engine_ignores_non_dns_or_non_syn_tcp() {
+        let fake_ip: Ipv4Addr = "100.100.100.101".parse().unwrap();
+        assert!(MagicDnsPacketInfo::parse(&tcp_syn(80, 1000, false), fake_ip).is_none());
+        assert!(MagicDnsPacketInfo::parse(&tcp_syn(53, 1000, true), fake_ip).is_none());
     }
 }
