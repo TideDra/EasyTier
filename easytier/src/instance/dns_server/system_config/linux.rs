@@ -4,7 +4,8 @@ mod resolved_fixture;
 use std::{
     fs, io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
-    sync::Mutex,
+    path::{Path, PathBuf},
+    sync::{Mutex, MutexGuard},
     time::Duration,
 };
 
@@ -27,17 +28,293 @@ const NETWORKD_MANAGER_PATH: &str = "/org/freedesktop/network1";
 const NETWORKD_MANAGER_INTERFACE: &str = "org.freedesktop.network1.Manager";
 const LINK_BUSY_ERROR: &str = "org.freedesktop.resolve1.LinkBusy";
 const DBUS_METHOD_TIMEOUT: Duration = Duration::from_secs(30);
+const RESOLV_CONF_PATH: &str = "/etc/resolv.conf";
+const RESOLV_CONF_BACKUP_PATH: &str = "/etc/resolv.conf.easytier.bak";
+const RESOLV_CONF_HEADER: &str = "# Added by easytier\n";
 
 pub fn new_configurator(interface: &str) -> io::Result<Box<dyn SystemConfig>> {
-    let resolv_conf = fs::read_to_string("/etc/resolv.conf")?;
-    let nsswitch = fs::read_to_string("/etc/nsswitch.conf").unwrap_or_default();
-    if !ResolvedConfigurator::uses_resolved(&resolv_conf, &nsswitch) {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "Automatic Magic DNS on Linux requires systemd-resolved in the system query path",
-        ));
+    Ok(Box::new(LinuxConfigurator::new(interface)))
+}
+
+enum LinuxBackend {
+    Resolved(ResolvedConfigurator),
+    Direct(DirectConfigurator),
+}
+
+/// Uses native `systemd-resolved` per-link split DNS when resolved is in the
+/// system query path and reachable over D-Bus; otherwise falls back to direct
+/// `/etc/resolv.conf` backup/restore (e.g. inside containers without D-Bus).
+pub struct LinuxConfigurator {
+    interface: String,
+    backend: Mutex<Option<LinuxBackend>>,
+}
+
+impl LinuxConfigurator {
+    pub fn new(interface: &str) -> Self {
+        Self {
+            interface: interface.to_owned(),
+            backend: Mutex::new(None),
+        }
     }
-    Ok(Box::new(ResolvedConfigurator::new(interface)))
+
+    fn backend(&self) -> io::Result<MutexGuard<'_, Option<LinuxBackend>>> {
+        let mut guard = self.backend.lock().unwrap();
+        if guard.is_none() {
+            let resolv_conf = match fs::read_to_string(RESOLV_CONF_PATH) {
+                Ok(content) => content,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
+                Err(error) => return Err(error),
+            };
+            let nsswitch = fs::read_to_string("/etc/nsswitch.conf").unwrap_or_default();
+            let selected = if ResolvedConfigurator::uses_resolved(&resolv_conf, &nsswitch) {
+                let resolved = ResolvedConfigurator::new(&self.interface);
+                match resolved.probe_dbus() {
+                    Ok(()) => LinuxBackend::Resolved(resolved),
+                    Err(error) => {
+                        tracing::info!(
+                            %error,
+                            "systemd-resolved D-Bus is unavailable; falling back to direct /etc/resolv.conf management"
+                        );
+                        LinuxBackend::Direct(DirectConfigurator::new())
+                    }
+                }
+            } else {
+                tracing::info!(
+                    "systemd-resolved is not in the system query path; using direct /etc/resolv.conf management"
+                );
+                LinuxBackend::Direct(DirectConfigurator::new())
+            };
+            *guard = Some(selected);
+        }
+        Ok(guard)
+    }
+}
+
+impl SystemConfig for LinuxConfigurator {
+    fn prepare(&self) -> io::Result<()> {
+        match self.backend()?.as_ref().unwrap() {
+            LinuxBackend::Resolved(configurator) => configurator.prepare(),
+            LinuxBackend::Direct(configurator) => configurator.prepare(),
+        }
+    }
+
+    fn set_dns(&self, cfg: &OSConfig) -> io::Result<()> {
+        match self.backend()?.as_ref().unwrap() {
+            LinuxBackend::Resolved(configurator) => configurator.set_dns(cfg),
+            LinuxBackend::Direct(configurator) => configurator.set_dns(cfg),
+        }
+    }
+
+    fn refresh(&self) -> io::Result<()> {
+        let guard = self.backend.lock().unwrap();
+        let Some(backend) = guard.as_ref() else {
+            return Ok(());
+        };
+        match backend {
+            LinuxBackend::Resolved(configurator) => configurator.refresh(),
+            LinuxBackend::Direct(configurator) => configurator.refresh(),
+        }
+    }
+
+    fn close(&self) -> io::Result<()> {
+        let guard = self.backend.lock().unwrap();
+        let Some(backend) = guard.as_ref() else {
+            return Ok(());
+        };
+        match backend {
+            LinuxBackend::Resolved(configurator) => configurator.close(),
+            LinuxBackend::Direct(configurator) => configurator.close(),
+        }
+    }
+}
+
+/// Directly manages `/etc/resolv.conf` with backup/restore when no D-Bus
+/// `systemd-resolved` integration is available (such as inside containers).
+pub struct DirectConfigurator {
+    resolv_conf: PathBuf,
+    backup_path: PathBuf,
+    desired: Mutex<Option<OSConfig>>,
+}
+
+impl Default for DirectConfigurator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DirectConfigurator {
+    pub fn new() -> Self {
+        Self::with_paths(RESOLV_CONF_PATH, RESOLV_CONF_BACKUP_PATH)
+    }
+
+    fn with_paths(resolv_conf: impl Into<PathBuf>, backup_path: impl Into<PathBuf>) -> Self {
+        Self {
+            resolv_conf: resolv_conf.into(),
+            backup_path: backup_path.into(),
+            desired: Mutex::new(None),
+        }
+    }
+
+    fn is_managed_content(content: &str) -> bool {
+        content.starts_with(RESOLV_CONF_HEADER)
+    }
+
+    fn apply_file(&self, cfg: &OSConfig) -> io::Result<()> {
+        let mut orig_nameservers = Vec::new();
+        let mut orig_search = Vec::new();
+        let mut orig_other = Vec::new();
+
+        let current_content = match fs::read_to_string(&self.resolv_conf) {
+            Ok(content) => Some(content),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(io::Error::other(format!(
+                    "Cannot read {} for Magic DNS: {error}",
+                    self.resolv_conf.display()
+                )));
+            }
+        };
+
+        let source = if current_content
+            .as_deref()
+            .is_some_and(Self::is_managed_content)
+        {
+            fs::read_to_string(&self.backup_path).ok()
+        } else {
+            current_content.clone()
+        };
+
+        if let Some(original) = source {
+            for line in original.lines() {
+                let trimmed = line.trim();
+                if let Some(ns) = trimmed
+                    .strip_prefix("nameserver")
+                    .and_then(|rest| rest.strip_prefix(|ch: char| ch.is_whitespace()))
+                {
+                    let ns = ns.split('#').next().unwrap_or_default().trim();
+                    if !ns.is_empty() {
+                        orig_nameservers.push(ns.to_owned());
+                    }
+                } else if let Some(search) = trimmed
+                    .strip_prefix("search")
+                    .and_then(|rest| rest.strip_prefix(|ch: char| ch.is_whitespace()))
+                {
+                    let search = search.split('#').next().unwrap_or_default();
+                    orig_search.extend(search.split_whitespace().map(str::to_owned));
+                } else if !trimmed.is_empty() && !trimmed.starts_with('#') {
+                    orig_other.push(line.to_owned());
+                }
+            }
+        }
+
+        if !Path::new(&self.backup_path).exists()
+            && let Some(current) = &current_content
+            && !Self::is_managed_content(current)
+        {
+            fs::copy(&self.resolv_conf, &self.backup_path)?;
+        }
+
+        let mut content = String::from(RESOLV_CONF_HEADER);
+        content.push_str("# Original resolv.conf backed up to ");
+        content.push_str(&self.backup_path.to_string_lossy());
+        content.push('\n');
+
+        for ns in &cfg.nameservers {
+            content.push_str("nameserver ");
+            content.push_str(ns);
+            content.push('\n');
+        }
+        for ns in &orig_nameservers {
+            if !cfg.nameservers.contains(ns) {
+                content.push_str("nameserver ");
+                content.push_str(ns);
+                content.push('\n');
+            }
+        }
+
+        let mut all_domains: Vec<&str> = Vec::new();
+        for domain in cfg.search_domains.iter().chain(cfg.match_domains.iter()) {
+            let domain = domain.trim_end_matches('.');
+            if !domain.is_empty() && !all_domains.contains(&domain) {
+                all_domains.push(domain);
+            }
+        }
+        for domain in &orig_search {
+            let domain = domain.trim_end_matches('.');
+            if !domain.is_empty() && !all_domains.contains(&domain) {
+                all_domains.push(domain);
+            }
+        }
+        if !all_domains.is_empty() {
+            content.push_str("search ");
+            content.push_str(&all_domains.join(" "));
+            content.push('\n');
+        }
+
+        let have_search = !all_domains.is_empty();
+        for line in &orig_other {
+            if have_search {
+                let trimmed = line.trim_start();
+                if trimmed.starts_with("domain ") || trimmed.starts_with("domain\t") {
+                    continue;
+                }
+            }
+            content.push_str(line);
+            content.push('\n');
+        }
+
+        fs::write(&self.resolv_conf, content)?;
+        Ok(())
+    }
+
+    fn restore_file(&self) -> io::Result<()> {
+        if let Ok(current) = fs::read_to_string(&self.resolv_conf)
+            && !Self::is_managed_content(&current)
+        {
+            return Ok(());
+        }
+
+        if self.backup_path.exists() {
+            fs::copy(&self.backup_path, &self.resolv_conf)?;
+            fs::remove_file(&self.backup_path)?;
+        } else {
+            let _ = fs::remove_file(&self.resolv_conf);
+        }
+        Ok(())
+    }
+}
+
+impl SystemConfig for DirectConfigurator {
+    fn prepare(&self) -> io::Result<()> {
+        self.restore_file()
+    }
+
+    fn set_dns(&self, cfg: &OSConfig) -> io::Result<()> {
+        let mut desired = self.desired.lock().unwrap();
+        self.apply_file(cfg)?;
+        *desired = Some(cfg.clone());
+        Ok(())
+    }
+
+    fn refresh(&self) -> io::Result<()> {
+        let desired = self.desired.lock().unwrap();
+        let Some(cfg) = desired.as_ref() else {
+            return Ok(());
+        };
+        let still_managed = fs::read_to_string(&self.resolv_conf)
+            .map(|content| Self::is_managed_content(&content))
+            .unwrap_or(false);
+        if still_managed {
+            return Ok(());
+        }
+        self.apply_file(cfg)
+    }
+
+    fn close(&self) -> io::Result<()> {
+        let mut desired = self.desired.lock().unwrap();
+        *desired = None;
+        self.restore_file()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -102,6 +379,18 @@ impl ResolvedConfigurator {
             .and_then(|builder| builder.method_timeout(DBUS_METHOD_TIMEOUT).build())?;
         *connection = Some(new.clone());
         Ok(new)
+    }
+
+    fn probe_dbus(&self) -> zbus::Result<()> {
+        let connection = self.connection()?;
+        let bus = Proxy::new(
+            &connection,
+            "org.freedesktop.DBus",
+            "/org/freedesktop/DBus",
+            "org.freedesktop.DBus",
+        )?;
+        let _: OwnedUniqueName = bus.call("GetNameOwner", &(RESOLVED_SERVICE,))?;
+        Ok(())
     }
 
     fn dbus_error(context: &str, error: zbus::Error) -> io::Error {
@@ -1024,5 +1313,56 @@ mod tests {
     #[tokio::test]
     async fn constructor_is_safe_in_a_tokio_context() {
         let _configurator = ResolvedConfigurator::new("lo");
+        let _linux = new_configurator("lo").unwrap();
+    }
+
+    #[test]
+    fn direct_configurator_backs_up_merges_refreshes_and_restores_resolv_conf() {
+        let temp = tempfile::tempdir().unwrap();
+        let resolv = temp.path().join("resolv.conf");
+        let backup = temp.path().join("resolv.conf.easytier.bak");
+        let initial = "\
+# Generated by Docker Engine.
+nameserver 127.0.0.53
+search host.internal
+domain legacy.internal
+options edns0 trust-ad
+";
+        fs::write(&resolv, initial).unwrap();
+
+        let configurator = DirectConfigurator::with_paths(&resolv, &backup);
+        configurator.set_dns(&config()).unwrap();
+        assert_eq!(fs::read_to_string(&backup).unwrap(), initial);
+        let written = fs::read_to_string(&resolv).unwrap();
+        assert!(written.starts_with(RESOLV_CONF_HEADER));
+        assert!(written.contains("nameserver 100.100.100.101\nnameserver 127.0.0.53\n"));
+        assert!(written.contains("search et.test internal.test host.internal\n"));
+        assert!(!written.contains("domain legacy.internal"));
+        assert!(written.contains("options edns0 trust-ad\n"));
+
+        // Repeated updates must read from the original backup rather than overwriting it.
+        configurator.set_dns(&updated_config()).unwrap();
+        assert_eq!(fs::read_to_string(&backup).unwrap(), initial);
+
+        // External overwrite is repaired by refresh().
+        fs::write(&resolv, "nameserver 8.8.8.8\n").unwrap();
+        configurator.refresh().unwrap();
+        assert!(
+            fs::read_to_string(&resolv)
+                .unwrap()
+                .starts_with(RESOLV_CONF_HEADER)
+        );
+
+        // Crash recovery via prepare() restores the original file cleanly.
+        let restarted = DirectConfigurator::with_paths(&resolv, &backup);
+        restarted.prepare().unwrap();
+        assert_eq!(fs::read_to_string(&resolv).unwrap(), initial);
+        assert!(!backup.exists());
+
+        // Normal lifecycle close() also restores the original file cleanly.
+        restarted.set_dns(&config()).unwrap();
+        restarted.close().unwrap();
+        assert_eq!(fs::read_to_string(&resolv).unwrap(), initial);
+        assert!(!backup.exists());
     }
 }
